@@ -1,0 +1,6 @@
+{"deadline":"2026-07-23T12:00:00Z","kind":"pilot-registration","pilot":"pilot-alpha.01","release":"worker-release-1","spool":"v1","startedAt":"2026-07-23T08:00:00Z"}
+{"at":"2026-07-23T08:05:00Z","claimed":"submit-42","kind":"pilot-heartbeat","pilot":"pilot-alpha.01","spool":"v1"}
+{"input":{"base64":"aGVsbG8gc3Bvb2w=","kind":"inline-base64"},"inputSchema":"example.input.v1","key":"submit-42","kind":"spool-invocation","operation":"example.echo","operationVersion":"1","resultSchema":"example.output.v1","spool":"v1"}
+{"input":{"digest":"sha256:abcdef","kind":"stored","path":"inputs/submit-99/value.bin"},"inputSchema":"example.input.v1","key":"submit-99","kind":"spool-invocation","operation":"example.transform","operationVersion":"2","resultSchema":"example.output.v1","spool":"v1"}
+{"deadline":"2026-07-23T12:00:00.500Z","kind":"pilot-registration","pilot":"pilot-beta","release":"worker-release-1","spool":"v1","startedAt":"2026-07-23T08:00:00.123456789Z"}
+{"at":"2026-07-23T08:06:00Z","claimed":null,"kind":"pilot-heartbeat","pilot":"pilot-alpha.01","spool":"v1"}

@@ -1,0 +1,12 @@
+.bsp/
+.idea/
+.metals/
+.scala-build/
+.vscode/
+project/project/
+project/target/
+target/
+**/target/
+.DS_Store
+__pycache__/
+*.pyc
