@@ -47,10 +47,28 @@ final case class RegisteredOperation[F[_]] private[runtime] (
   */
 final class OperationRegistry[F[_]] private (
     val catalog: OperationCatalog,
-    handlers: Map[(OperationId, OperationVersion), RegisteredOperation[F]]
+    handlers: Map[(OperationId, OperationVersion), RegisteredOperation[F]],
+    typed: Map[(OperationId, OperationVersion), OperationRegistry.Entry[F, ?, ?]]
 ):
   def lookup(descriptor: OperationDescriptor): Option[RegisteredOperation[F]] =
     handlers.get((descriptor.id, descriptor.version)).filter(_.descriptor == descriptor)
+
+  /** All typed entries, for bridges that reconstruct per-entry typed views (worker registries). */
+  def entries: Vector[OperationRegistry.Entry[F, ?, ?]] = typed.values.toVector
+
+  /** The typed entry registered for `op`, if its full descriptor matches.
+    *
+    * This is the registry's other audited erasure point (the first is
+    * [[RegisteredOperation.encodeInput]]): the entry was registered under a `SiteOperation[I', O']`
+    * whose descriptor equals `op.descriptor`, so both sides agree on the wire schemas; the
+    * phantom-level refinement `?, ?` → `I, O` is sound at the byte level and confined to this
+    * method.
+    */
+  def typedEntry[I, O](op: SiteOperation[I, O]): Option[OperationRegistry.Entry[F, I, O]] =
+    typed
+      .get((op.id, op.version))
+      .filter(_.operation.descriptor == op.descriptor)
+      .map(_.asInstanceOf[OperationRegistry.Entry[F, I, O]])
 
 object OperationRegistry:
   /** A typed registry entry. `run` may raise in `F`; the registry converts raised errors into
@@ -98,7 +116,8 @@ object OperationRegistry:
           else Right(handlers.updated(key, lower(descriptor, entry)))
         }
       }
-    yield new OperationRegistry(catalog, handlers)
+      typed = entries.map(entry => (entry.operation.id, entry.operation.version) -> entry).toMap
+    yield new OperationRegistry(catalog, handlers, typed)
 
   private def lower[F[_]: Sync, I, O](
       descriptor: OperationDescriptor,

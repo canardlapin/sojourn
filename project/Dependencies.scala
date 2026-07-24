@@ -17,6 +17,9 @@ object Dependencies {
     val scalaSlurmProtocol =
       "io.github.bbuchsbaum" %% "scala-slurm-protocol" % Versions.scalaSlurm
     val scalaSlurmWorker = "io.github.bbuchsbaum" %% "scala-slurm-worker" % Versions.scalaSlurm
+    val scalaSlurmManaged =
+      "io.github.bbuchsbaum" %% "scala-slurm-managed" % Versions.scalaSlurm
+    val scalaSlurmLocal = "io.github.bbuchsbaum" %% "scala-slurm-local" % Versions.scalaSlurm
     val catsEffect = "org.typelevel" %% "cats-effect" % Versions.catsEffect
     val fs2Core = "co.fs2" %% "fs2-core" % Versions.fs2
     val fs2Io = "co.fs2" %% "fs2-io" % Versions.fs2

@@ -1,0 +1,90 @@
+package io.github.bbuchsbaum.sojourn.demo
+
+import cats.effect.IO
+import io.github.bbuchsbaum.scalaslurm.core.OperationId
+import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
+import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
+import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
+import io.github.bbuchsbaum.sojourn.SiteOperation
+import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
+import io.github.bbuchsbaum.sojourn.tck.TckWire
+
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.UUID
+import scala.concurrent.duration.*
+
+/** The demo operation set: the four TCK-documented behaviors, executable identically in-process
+  * (local backend) and in a separate worker JVM on a cluster (one-shot binary).
+  *
+  * Cross-process execution counting: when `SOJOURN_DEMO_COUNT_DIR` is set in the worker's
+  * environment, each `counting` execution drops a unique marker file there; the observing side
+  * counts markers. In-process harnesses may instead count via the same directory, so one mechanism
+  * serves both execution shapes.
+  */
+object DemoOperations:
+  private def operation(name: String): SiteOperation[String, String] =
+    SiteOperation(
+      OperationId.from(s"sojourn.tck.$name").toOption.get,
+      OperationVersion.from("1").toOption.get,
+      TckWire.stringInputSchema,
+      TckWire.stringResultSchema
+    )
+
+  val echo: SiteOperation[String, String] = operation("echo")
+  val failing: SiteOperation[String, String] = operation("failing")
+  val sleepy: SiteOperation[String, String] = operation("sleepy")
+  val counting: SiteOperation[String, String] = operation("counting")
+
+  /** The registry both the submitting side and the worker binary build — one definition, every
+    * execution shape.
+    */
+  def registry(countDirectory: Option[Path]): Either[ValidationFailure, OperationRegistry[IO]] =
+    OperationRegistry.from[IO](
+      Vector(
+        OperationRegistry.entry(
+          echo,
+          TckWire.stringInput,
+          TckWire.stringResult,
+          RetrySafety.SafeForAutomaticRetry
+        )(input => IO.pure(s"echo:$input")),
+        OperationRegistry.entry(
+          failing,
+          TckWire.stringInput,
+          TckWire.stringResult,
+          RetrySafety.Unknown
+        )(_ => IO.raiseError(new RuntimeException("deliberate failure"))),
+        OperationRegistry.entry(
+          sleepy,
+          TckWire.stringInput,
+          TckWire.stringResult,
+          RetrySafety.Unknown
+        )(input => IO.sleep(30.seconds).as(input)),
+        OperationRegistry.entry(
+          counting,
+          TckWire.stringInput,
+          TckWire.stringResult,
+          RetrySafety.SafeForAutomaticRetry
+        )(input => recordExecution(countDirectory).as(input))
+      )
+    )
+
+  /** Count observed `counting` executions: the number of marker files. */
+  def executions(countDirectory: Path): IO[Long] =
+    IO.blocking {
+      if Files.isDirectory(countDirectory) then Files.list(countDirectory).count()
+      else 0L
+    }
+
+  private def recordExecution(countDirectory: Option[Path]): IO[Unit] =
+    countDirectory match
+      case None            => IO.unit
+      case Some(directory) =>
+        IO.blocking {
+          Files.createDirectories(directory)
+          val _ = Files.createFile(directory.resolve(s"execution-${UUID.randomUUID()}"))
+        }
+
+  /** The worker-side count directory, from the process environment. */
+  def countDirectoryFromEnvironment: Option[Path] =
+    sys.env.get("SOJOURN_DEMO_COUNT_DIR").map(Path.of(_))

@@ -18,7 +18,7 @@ ThisBuild / Test / fork := true
 lazy val root = project
   .in(file("."))
   .enablePlugins(NoPublishPlugin)
-  .aggregate(core, runtime, local, tck, demo)
+  .aggregate(core, runtime, local, slurm, tck, demo)
   .settings(name := "sojourn")
 
 // The scheduler-neutral kernel: typed site/lease/task surface plus the spool
@@ -79,6 +79,24 @@ lazy val local = project
     )
   )
 
+// The exemplary Slurm backend: batch execution composed from scala-slurm's
+// local CLI scheduler, durable managed control, registered-task staging, and
+// strict result attachment, over a shared-filesystem store. IO-shaped for now:
+// the upstream worker pipeline is IO-hardcoded (recorded wart), and this module
+// commits to it rather than pretending polymorphism it cannot honor.
+lazy val slurm = project
+  .in(file("modules/slurm"))
+  .dependsOn(runtime, tck % "test->compile")
+  .settings(
+    name := "sojourn-slurm",
+    libraryDependencies ++= Seq(
+      Libraries.scalaSlurmManaged,
+      Libraries.scalaSlurmLocal,
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test
+    )
+  )
+
 // Published conformance kit (main scope, cats-laws pattern): abstract suites a
 // Site[F] backend instantiates over a TckHarness Resource.
 lazy val tck = project
@@ -95,13 +113,20 @@ lazy val tck = project
     )
   )
 
-// Unpublished demo operations and entry-point mains used by tests and acceptance.
+// Unpublished demo operations and the worker entry-point main used by tests and
+// acceptance. `demo/assembly` produces the one-shot worker binary the Slurm
+// acceptance run stages onto the shared workspace.
 lazy val demo = project
   .in(file("modules/demo"))
   .enablePlugins(NoPublishPlugin)
-  .dependsOn(local)
+  .dependsOn(local, slurm, tck)
   .settings(
     name := "sojourn-demo",
+    Compile / mainClass := Some("io.github.bbuchsbaum.sojourn.demo.DemoWorkerMain"),
+    assembly / assemblyMergeStrategy := {
+      case PathList("META-INF", xs @ _*) => MergeStrategy.discard
+      case _                             => MergeStrategy.first
+    },
     libraryDependencies ++= Seq(
       Libraries.munit % Test,
       Libraries.munitCatsEffect % Test
