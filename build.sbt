@@ -18,7 +18,7 @@ ThisBuild / Test / fork := true
 lazy val root = project
   .in(file("."))
   .enablePlugins(NoPublishPlugin)
-  .aggregate(core, runtime, local, slurm, tck, demo)
+  .aggregate(core, runtime, local, slurm, dsl, tck, demo)
   .settings(name := "sojourn")
 
 // The scheduler-neutral kernel: typed site/lease/task surface plus the spool
@@ -93,6 +93,22 @@ lazy val slurm = project
     libraryDependencies ++= Seq(
       Libraries.scalaSlurmManaged,
       Libraries.scalaSlurmLocal,
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test
+    )
+  )
+
+// The ergonomics layer: five-line quickstarts without giving up an inch of the
+// honest core. Wire[A] givens derive codecs and schemas; Op bundles an
+// operation with its runner; Sojourn.local/slurm are one-call facades; run and
+// .value are documented opt-in conveniences that collapse the total TaskOutcome
+// into a typed exception (the full handle/outcome surface stays underneath).
+lazy val dsl = project
+  .in(file("modules/dsl"))
+  .dependsOn(local, slurm)
+  .settings(
+    name := "sojourn-dsl",
+    libraryDependencies ++= Seq(
       Libraries.munit % Test,
       Libraries.munitCatsEffect % Test
     )

@@ -7,6 +7,27 @@ deadline, degradation, revocation), and a reference-passing remote data plane.
 The name is queueing theory's *sojourn time*: the total time a job spends in the
 system — the fact this library refuses to hide.
 
+```scala
+import cats.effect.{IO, IOApp}
+import io.github.bbuchsbaum.sojourn.dsl.*
+
+object Quickstart extends IOApp.Simple:
+  val shout = Op[String, String]("shout")(s => IO.pure(s.toUpperCase))
+
+  def run = Sojourn.local("dev", shout).use { site =>
+    site.run(shout, "hello").flatMap(IO.println)      // HELLO
+  }
+```
+
+Swap `Sojourn.local` for `Sojourn.slurm(...)` and the same code runs each task
+as a scheduler job on a cluster. `site.run` is a documented convenience that
+collapses the total outcome into a typed exception carrying full evidence; the
+honest surface — `submit`/`outcome` with `Succeeded | Failed | Interrupted |
+Unknown`, keyed idempotent resubmission, `RemoteRef` reference-passing, leased
+pools with `awaitGranted` — is one method away, and `site.raw` exposes the
+entire SPI. Operations default to at-most-once (`RetrySafety.Unknown`);
+`.retrySafe` is an explicit opt-in to automatic requeue.
+
 The scheduler-specific substrate is [scala-slurm](../scala-slurm); sojourn's API
 is scheduler-neutral and Slurm words never appear in it. The two truths a batch
 backend cannot abstract away — the queue and the walltime lease — are modeled in
@@ -34,6 +55,7 @@ machine). Program plan: `docs/plans/2026-07-24-remote-executor.md`.
 | `sojourn-runtime` | Scheduler-neutral effectful machinery: content-addressed shared-FS store, operation registry, site preflight probes, the one worker binary (one-shot + pilot modes), pilot loop, pool dispatcher (reclaim ladder, epoch fence, lease governance) |
 | `sojourn-local` | Scheduler-free backend: batch on supervised fibers, pool as in-process pilots over a real filesystem spool — the neutrality proof and dev-mode |
 | `sojourn-slurm` | The exemplary Slurm backend: durable managed submission, typed staging, strict digest-verified result attachment over a shared workspace |
+| `sojourn-dsl` | The ergonomics layer: `Wire[A]` givens (schema + codecs from one definition), `Op`, compile-time-checked identifier literals, `Sojourn.local`/`slurm` facades, `run`/`value` conveniences over the total outcome |
 | `sojourn-tck` | Published conformance suites (`StoreTck`, `BatchTck`, `PoolTck`, `ParityTck`) any backend instantiates over a `TckHarness` |
 | `sojourn-demo` | Unpublished demo operations + the assembled worker binary used by tests and acceptance |
 
