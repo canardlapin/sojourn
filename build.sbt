@@ -18,7 +18,7 @@ ThisBuild / Test / fork := true
 lazy val root = project
   .in(file("."))
   .enablePlugins(NoPublishPlugin)
-  .aggregate(core)
+  .aggregate(core, runtime, local, tck, demo)
   .settings(name := "sojourn")
 
 // The scheduler-neutral kernel: typed site/lease/task surface plus the spool
@@ -39,5 +39,70 @@ lazy val core = project
       Libraries.munitCatsEffect % Test,
       Libraries.munitScalaCheck % Test,
       Libraries.scalaCheck % Test
+    )
+  )
+
+// Scheduler-neutral effectful machinery: the content-addressed shared-filesystem
+// store, the operation registry, the one-binary entry point (one-shot batch mode
+// now; pilot mode arrives with the spool runtime), site preflight probes, and
+// release staging. Depends on scala-slurm worker for the AtomicFiles kernel and
+// the envelope/publication discipline — worker is scheduler-free.
+lazy val runtime = project
+  .in(file("modules/runtime"))
+  .dependsOn(core)
+  .settings(
+    name := "sojourn-runtime",
+    libraryDependencies ++= Seq(
+      Libraries.scalaSlurmWorker,
+      Libraries.scalaSlurmProtocol,
+      Libraries.catsEffect,
+      Libraries.fs2Core,
+      Libraries.fs2Io,
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test,
+      Libraries.munitScalaCheck % Test,
+      Libraries.scalaCheck % Test
+    )
+  )
+
+// The scheduler-free backend: batch execution on supervised fibers through the
+// real envelope-publication path over a local filesystem store. Proves the SPI
+// is implementable without a scheduler and gives the TCK a fast target.
+lazy val local = project
+  .in(file("modules/local"))
+  .dependsOn(runtime, tck % "test->compile")
+  .settings(
+    name := "sojourn-local",
+    libraryDependencies ++= Seq(
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test
+    )
+  )
+
+// Published conformance kit (main scope, cats-laws pattern): abstract suites a
+// Site[F] backend instantiates over a TckHarness Resource.
+lazy val tck = project
+  .in(file("modules/tck"))
+  .dependsOn(core)
+  .settings(
+    name := "sojourn-tck",
+    libraryDependencies ++= Seq(
+      Libraries.catsEffect,
+      Libraries.munit,
+      Libraries.munitCatsEffect,
+      Libraries.scalaCheck
+    )
+  )
+
+// Unpublished demo operations and entry-point mains used by tests and acceptance.
+lazy val demo = project
+  .in(file("modules/demo"))
+  .enablePlugins(NoPublishPlugin)
+  .dependsOn(local)
+  .settings(
+    name := "sojourn-demo",
+    libraryDependencies ++= Seq(
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test
     )
   )

@@ -124,7 +124,53 @@ final case class SiteOperation[I, O](
     version: OperationVersion,
     inputSchema: SchemaId,
     resultSchema: ResultSchemaId
+) derives CanEqual:
+  /** The untyped wire identity of this operation. */
+  def descriptor: OperationDescriptor =
+    OperationDescriptor(id, version, inputSchema, resultSchema)
+
+/** The untyped wire identity of one registered operation: id, version, and schema pair. */
+final case class OperationDescriptor(
+    id: OperationId,
+    version: OperationVersion,
+    inputSchema: SchemaId,
+    resultSchema: ResultSchemaId
 ) derives CanEqual
+
+/** The set of operations a site can execute — the registry handshake made data.
+  *
+  * Construction validates that no (id, version) pair is claimed twice with different schemas; a
+  * submit against an operation outside the catalog is refused as
+  * [[SubmitRejection.UnknownOperation]] rather than dispatched to fail remotely.
+  */
+final case class OperationCatalog private (
+    entries: Map[(OperationId, OperationVersion), OperationDescriptor]
+) derives CanEqual:
+  def contains(descriptor: OperationDescriptor): Boolean =
+    entries.get((descriptor.id, descriptor.version)).contains(descriptor)
+
+  def descriptors: Vector[OperationDescriptor] = entries.values.toVector
+
+object OperationCatalog:
+  val empty: OperationCatalog = OperationCatalog(Map.empty)
+
+  def from(operations: Vector[OperationDescriptor]): Either[ValidationFailure, OperationCatalog] =
+    operations.foldLeft(Right(empty): Either[ValidationFailure, OperationCatalog]) {
+      (accumulated, descriptor) =>
+        accumulated.flatMap { catalog =>
+          val key = (descriptor.id, descriptor.version)
+          catalog.entries.get(key) match
+            case None => Right(OperationCatalog(catalog.entries.updated(key, descriptor)))
+            case Some(existing) if existing == descriptor => Right(catalog)
+            case Some(_)                                  =>
+              Left(
+                ValidationFailure(
+                  "operationCatalog",
+                  s"operation '${descriptor.id.value}' version '${descriptor.version.value}' is registered twice with different schemas"
+                )
+              )
+        }
+    }
 
 /** How a task input is supplied: inline by value, or by reference to a value already in the store.
   */
@@ -134,8 +180,10 @@ enum TaskInput[I] derives CanEqual:
 
 /** A validated specification for a leased pilot pool.
   *
-  * Construction is private; [[PoolSpec.from]] enforces the single cross-field invariant that a pool
-  * cannot require more ready pilots than it ever provisions.
+  * Construction is private; [[PoolSpec.from]] enforces the cross-field invariants that a pool
+  * cannot require more ready pilots than it ever provisions and that the drain grace fits inside
+  * the walltime. `readyTimeout` bounds how long the lease may sit below its readiness floor after
+  * acquisition before it revokes as lost.
   */
 final case class PoolSpec private (
     pilots: PositiveInt,
@@ -143,6 +191,7 @@ final case class PoolSpec private (
     walltime: WallTimeMinutes,
     drainGrace: DurationMillis,
     heartbeatEvery: DurationMillis,
+    readyTimeout: DurationMillis,
     spoolRoot: SitePath
 ) derives CanEqual
 
@@ -153,10 +202,14 @@ object PoolSpec:
       walltime: WallTimeMinutes,
       drainGrace: DurationMillis,
       heartbeatEvery: DurationMillis,
+      readyTimeout: DurationMillis,
       spoolRoot: SitePath
   ): Either[ValidationFailure, PoolSpec] =
-    Either.cond(
-      minReady.toInt <= pilots.toInt,
-      PoolSpec(pilots, minReady, walltime, drainGrace, heartbeatEvery, spoolRoot),
-      ValidationFailure("poolSpec", "minReady must not exceed pilots")
-    )
+    if minReady.toInt > pilots.toInt then
+      Left(ValidationFailure("poolSpec", "minReady must not exceed pilots"))
+    else if drainGrace.value >= walltime.toLong * 60_000L then
+      Left(ValidationFailure("poolSpec", "drainGrace must be shorter than the walltime"))
+    else
+      Right(
+        PoolSpec(pilots, minReady, walltime, drainGrace, heartbeatEvery, readyTimeout, spoolRoot)
+      )

@@ -44,6 +44,11 @@ enum TaskOutcome[+O] derives CanEqual:
 enum SubmitRejection derives CanEqual:
   case UnknownOperation(id: OperationId)
   case InvalidInput(failure: ValidationFailure)
+
+  /** The key was already submitted with a different operation or input; the original task is
+    * untouched and the caller must pick a fresh key (or attach to the original).
+    */
+  case Conflict(key: SubmissionKey)
   case Closed
 
 /** A live handle to a submitted task. */
@@ -56,6 +61,13 @@ trait TaskHandle[F[_], O]:
 
   /** Completes with the terminal [[TaskOutcome]] once the task settles. */
   def await: F[TaskOutcome[O]]
+
+  /** Request cancellation. Best-effort and observational: the request is delivered, and the
+    * terminal outcome still arrives through [[await]] — typically as [[TaskOutcome.Interrupted]],
+    * but a task that settles before the request lands keeps its original outcome. Never throws;
+    * delivery problems surface in the outcome's diagnostics.
+    */
+  def cancel: F[Unit]
 
 /** Submits typed operations and hands back task handles. */
 trait TaskRunner[F[_]]:
@@ -104,6 +116,20 @@ trait SiteStore[F[_]]:
     */
   def resolve[A](path: SitePath, schema: SchemaId): F[Either[StoreFailure, RemoteRef[A]]]
 
+  /** Persist a large payload streamed as raw bytes and return a reference to it. The reference's
+    * phantom tag is `Vector[Byte]` — streamed objects carry no codec-level type.
+    */
+  def putStream(
+      bytes: fs2.Stream[F, Byte],
+      schema: SchemaId
+  ): F[Either[StoreFailure, RemoteRef[Vector[Byte]]]]
+
+  /** Stream the raw bytes named by `ref`. The digest is verified before the first byte is emitted;
+    * a mismatch fails the stream's effect with a typed [[StoreFailure]] via the returned effect
+    * boundary, never with partially-yielded corrupt data.
+    */
+  def fetchStream[A](ref: RemoteRef[A]): fs2.Stream[F, Byte]
+
 /** A scheduler-neutral compute and data facade for one site.
   *
   * `batch` runs tasks directly against the underlying scheduler; `pool` acquires a leased pilot
@@ -112,6 +138,10 @@ trait SiteStore[F[_]]:
   */
 trait Site[F[_]]:
   def name: SiteName
+
+  /** The operations this site can execute; [[TaskRunner.submit]] refuses anything outside it. */
+  def operations: OperationCatalog
+
   def store: SiteStore[F]
   def batch: TaskRunner[F]
   def pool(spec: PoolSpec): Resource[F, LeasedPool[F]]

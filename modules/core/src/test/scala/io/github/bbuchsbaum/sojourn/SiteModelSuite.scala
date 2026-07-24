@@ -100,12 +100,46 @@ class SiteModelSuite extends munit.ScalaCheckSuite:
     val walltime = WallTimeMinutes.from(120L).toOption.get
     val drainGrace = DurationMillis.from(5000L).toOption.get
     val heartbeat = DurationMillis.from(1000L).toOption.get
+    val ready = DurationMillis.from(60000L).toOption.get
     val root = SitePath.from("spool/pool").toOption.get
 
-    assert(PoolSpec.from(two, four, walltime, drainGrace, heartbeat, root).isLeft)
-    assert(PoolSpec.from(four, two, walltime, drainGrace, heartbeat, root).isRight)
+    assert(PoolSpec.from(two, four, walltime, drainGrace, heartbeat, ready, root).isLeft)
+    assert(PoolSpec.from(four, two, walltime, drainGrace, heartbeat, ready, root).isRight)
     assertEquals(
-      PoolSpec.from(two, two, walltime, drainGrace, heartbeat, root).map(_.minReady.toInt),
+      PoolSpec.from(two, two, walltime, drainGrace, heartbeat, ready, root).map(_.minReady.toInt),
       Right(2)
     )
+  }
+
+  test("PoolSpec rejects a drain grace that reaches the walltime") {
+    val one = PositiveInt.from("count", 1).toOption.get
+    val walltime = WallTimeMinutes.from(1L).toOption.get
+    val tooLong = DurationMillis.from(60000L).toOption.get
+    val fits = DurationMillis.from(59999L).toOption.get
+    val heartbeat = DurationMillis.from(1000L).toOption.get
+    val ready = DurationMillis.from(60000L).toOption.get
+    val root = SitePath.from("spool/pool").toOption.get
+
+    assert(PoolSpec.from(one, one, walltime, tooLong, heartbeat, ready, root).isLeft)
+    assert(PoolSpec.from(one, one, walltime, fits, heartbeat, ready, root).isRight)
+  }
+
+  test("OperationCatalog rejects the same id+version with different schemas") {
+    def descriptor(id: String, version: String, in: String, out: String) =
+      OperationDescriptor(
+        io.github.bbuchsbaum.scalaslurm.core.OperationId.from(id).toOption.get,
+        io.github.bbuchsbaum.scalaslurm.core.OperationVersion.from(version).toOption.get,
+        io.github.bbuchsbaum.scalaslurm.core.SchemaId.from(in).toOption.get,
+        io.github.bbuchsbaum.scalaslurm.core.ResultSchemaId.from(out).toOption.get
+      )
+    val echo = descriptor("example.echo", "1", "in.v1", "out.v1")
+    val drifted = descriptor("example.echo", "1", "in.v2", "out.v1")
+    val versioned = descriptor("example.echo", "2", "in.v2", "out.v1")
+
+    assert(OperationCatalog.from(Vector(echo, drifted)).isLeft)
+    val catalog = OperationCatalog.from(Vector(echo, echo, versioned)).toOption.get
+    assert(catalog.contains(echo))
+    assert(catalog.contains(versioned))
+    assert(!catalog.contains(drifted))
+    assertEquals(catalog.descriptors.size, 2)
   }

@@ -14,6 +14,9 @@ object Dependencies {
 
   object Libraries {
     val scalaSlurmCore = "io.github.bbuchsbaum" %% "scala-slurm-core" % Versions.scalaSlurm
+    val scalaSlurmProtocol =
+      "io.github.bbuchsbaum" %% "scala-slurm-protocol" % Versions.scalaSlurm
+    val scalaSlurmWorker = "io.github.bbuchsbaum" %% "scala-slurm-worker" % Versions.scalaSlurm
     val catsEffect = "org.typelevel" %% "cats-effect" % Versions.catsEffect
     val fs2Core = "co.fs2" %% "fs2-core" % Versions.fs2
     val fs2Io = "co.fs2" %% "fs2-io" % Versions.fs2
