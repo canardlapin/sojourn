@@ -109,7 +109,6 @@ object PoolDispatcher:
       token: String,
       descriptor: OperationDescriptor,
       inputIdentity: ContentDigest,
-      invocation: SpoolInvocation,
       epoch: Ref[IO, AttemptEpoch],
       retriesUsed: Ref[IO, Int],
       status: Ref[IO, TaskStatus],
@@ -140,7 +139,7 @@ object PoolDispatcher:
       val granted: Ref[IO, Boolean],
       val everGranted: Ref[IO, Boolean],
       val drainWritten: Ref[IO, Boolean],
-      val terminal: Ref[IO, Option[LeaseEvent]],
+      val terminal: Ref[IO, Option[LeaseEvent.Revoked]],
       val revoked: Deferred[IO, Unit],
       val topic: Topic[IO, LeaseEvent],
       val resolvedTombstones: Ref[IO, Set[String]],
@@ -159,7 +158,7 @@ object PoolDispatcher:
         granted <- Ref.of[IO, Boolean](false)
         everGranted <- Ref.of[IO, Boolean](false)
         drainWritten <- Ref.of[IO, Boolean](false)
-        terminal <- Ref.of[IO, Option[LeaseEvent]](None)
+        terminal <- Ref.of[IO, Option[LeaseEvent.Revoked]](None)
         revoked <- Deferred[IO, Unit]
         topic <- Topic[IO, LeaseEvent]
         resolvedTombstones <- Ref.of[IO, Set[String]](Set.empty)
@@ -302,66 +301,94 @@ object PoolDispatcher:
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
       val token = KeyToken.forKey(key).value
+      for
+        submittedAt <- now
+        attemptId <- mintAttemptId(token)
+        outcome <- attemptId match
+          case Left(rejection) => IO.pure(Left(rejection))
+          case Right(minted)   =>
+            for
+              epoch <- Ref.of[IO, AttemptEpoch](AttemptEpoch.initial)
+              retries <- Ref.of[IO, Int](0)
+              status <- Ref.of[IO, TaskStatus](
+                TaskStatus(TaskPhase.Queued, Freshness.Current(submittedAt))
+              )
+              evidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
+              deferred <- Deferred[IO, TaskOutcome[Nothing]]
+              candidate = PoolTask(
+                key,
+                token,
+                op.descriptor,
+                identity,
+                epoch,
+                retries,
+                status,
+                evidence,
+                deferred
+              )
+              decision <- state.tasks.modify { current =>
+                current.get(key) match
+                  case Some(existing)
+                      if existing.descriptor == op.descriptor &&
+                        existing.inputIdentity == identity =>
+                    (current, Right(existing))
+                  case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
+                  case None    => (current.updated(key, candidate), Right(candidate))
+              }
+              handle <- decision match
+                case Left(rejection) => IO.pure(Left(rejection))
+                case Right(task)     =>
+                  if task eq candidate then
+                    // Re-check closure AFTER the insertion: `closed` flips before the terminal
+                    // sweep enumerates tasks, so an insert the sweep cannot see must observe the
+                    // flag here and withdraw — otherwise the handle could never settle.
+                    state.closed.get.flatMap {
+                      case true =>
+                        state.tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                      case false =>
+                        stageAndPublish(op, registered, prepared, minted, submittedAt, task)
+                          .as(Right(taskHandle[O](task)))
+                    }
+                  else IO.pure(Right(taskHandle[O](task)))
+            yield handle
+      yield outcome
+
+    /** Stage the input and publish the epoch-1 invocation for a freshly admitted task. Both failure
+      * modes are infrastructure faults of the site, not input validation problems: the task is
+      * admitted and settles `Failed` with the typed evidence (the submission provably never ran).
+      */
+    private def stageAndPublish[I, O](
+        op: SiteOperation[I, O],
+        registered: RegisteredOperation[IO],
+        prepared: PreparedInput,
+        attemptId: AttemptId,
+        submittedAt: Instant,
+        task: PoolTask
+    ): IO[Unit] =
       stageInput(op, prepared).flatMap {
-        case Left(rejection)   => IO.pure(Left(rejection))
+        case Left(storeFailure) =>
+          settleFailed(
+            task,
+            FailureCause.RequestPreparationFailed(
+              "input-staging-failed" +: SpoolEvidence.storeFailureCodes(storeFailure)
+            ),
+            Vector.empty
+          )
         case Right(spoolInput) =>
-          for
-            submittedAt <- now
-            attemptId <- mintAttemptId(token)
-            outcome <- attemptId match
-              case Left(rejection) => IO.pure(Left(rejection))
-              case Right(minted)   =>
-                val invocation = SpoolInvocation(
-                  key,
-                  minted,
-                  AttemptEpoch.initial,
-                  op.id,
-                  op.version,
-                  op.inputSchema,
-                  op.resultSchema,
-                  registered.retrySafety,
-                  config.manifest.limits,
-                  submittedAt,
-                  spoolInput
-                )
-                for
-                  epoch <- Ref.of[IO, AttemptEpoch](AttemptEpoch.initial)
-                  retries <- Ref.of[IO, Int](0)
-                  status <- Ref.of[IO, TaskStatus](
-                    TaskStatus(TaskPhase.Queued, Freshness.Current(submittedAt))
-                  )
-                  evidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
-                  deferred <- Deferred[IO, TaskOutcome[Nothing]]
-                  candidate = PoolTask(
-                    key,
-                    token,
-                    op.descriptor,
-                    identity,
-                    invocation,
-                    epoch,
-                    retries,
-                    status,
-                    evidence,
-                    deferred
-                  )
-                  decision <- state.tasks.modify { current =>
-                    current.get(key) match
-                      case Some(existing)
-                          if existing.descriptor == op.descriptor &&
-                            existing.inputIdentity == identity =>
-                        (current, Right(existing))
-                      case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
-                      case None    => (current.updated(key, candidate), Right(candidate))
-                  }
-                  handle <- decision match
-                    case Left(rejection) => IO.pure(Left(rejection))
-                    case Right(task)     =>
-                      val publishFirst =
-                        if task eq candidate then publishNewInvocation(task)
-                        else IO.unit
-                      publishFirst.as(Right(taskHandle[O](task)))
-                yield handle
-          yield outcome
+          val invocation = SpoolInvocation(
+            task.key,
+            attemptId,
+            AttemptEpoch.initial,
+            op.id,
+            op.version,
+            op.inputSchema,
+            op.resultSchema,
+            registered.retrySafety,
+            config.manifest.limits,
+            submittedAt,
+            spoolInput
+          )
+          publishNewInvocation(task, invocation)
       }
 
     /** Stage the input into its spool carrier: small encoded inputs travel inline; anything larger
@@ -370,7 +397,7 @@ object PoolDispatcher:
     private def stageInput[I, O](
         op: SiteOperation[I, O],
         prepared: PreparedInput
-    ): IO[Either[SubmitRejection, SpoolInput]] =
+    ): IO[Either[StoreFailure, SpoolInput]] =
       prepared match
         case PreparedInput.Referenced(path, digest) =>
           IO.pure(Right(SpoolInput.Stored(path, digest)))
@@ -378,19 +405,9 @@ object PoolDispatcher:
           if bytes.size.toLong <= config.manifest.limits.maximumInlineInputBytes.value.toLong then
             IO.pure(Right(SpoolInput.InlineBase64(bytes)))
           else
-            store.putBytes(bytes, op.inputSchema).map {
-              case Right(ref)         => Right(SpoolInput.Stored(ref.path, ref.digest))
-              case Left(storeFailure) =>
-                Left(
-                  SubmitRejection.InvalidInput(
-                    ValidationFailure(
-                      "input",
-                      ("stored-input-staging-failed" +: storeFailureCodes(storeFailure))
-                        .mkString(";")
-                    )
-                  )
-                )
-            }
+            store
+              .putBytes(bytes, op.inputSchema)
+              .map(_.map(ref => SpoolInput.Stored(ref.path, ref.digest)))
 
     private def mintAttemptId(token: String): IO[Either[SubmitRejection, AttemptId]] =
       IO(UUID.randomUUID().toString.toLowerCase).map { uuid =>
@@ -400,23 +417,18 @@ object PoolDispatcher:
           .map(failure => SubmitRejection.InvalidInput(failure))
       }
 
-    private def publishNewInvocation(task: PoolTask): IO[Unit] =
-      spool.publishInvocation(task.invocation).flatMap {
+    private def publishNewInvocation(task: PoolTask, invocation: SpoolInvocation): IO[Unit] =
+      spool.publishInvocation(invocation).flatMap {
         case Right(())          => IO.unit
         case Left(writeFailure) =>
           // The invocation never reached the spool: the task provably never ran, but this is an
           // infrastructure fault of the site, reported as a settled failure with the evidence.
-          settle(
+          settleFailed(
             task,
-            TaskOutcome.Failed(
-              FailureDiagnosis(
-                FailureCause.RuntimeError(
-                  s"spool-invocation-publish-failed: ${describeWrite(writeFailure)}"
-                ),
-                Vector.empty,
-                Vector.empty
-              )
-            )
+            FailureCause.RuntimeError(
+              s"spool-invocation-publish-failed: ${SpoolEvidence.describeWrite(writeFailure)}"
+            ),
+            Vector.empty
           )
       }
 
@@ -443,24 +455,21 @@ object PoolDispatcher:
               case Right(pendingFile) =>
                 spool.claimInto(pendingFile, spool.paths.poolReclaimed).flatMap {
                   case Right(_) =>
-                    settle(
+                    settleInterrupted(
                       task,
-                      TaskOutcome.Interrupted(
-                        diags(
-                          Diagnostic(
-                            "cancel-requested",
-                            "cancelled by the submitter before any pilot claimed the " +
-                              "invocation; execution requires a claim, so it provably never ran"
-                          )
-                        )
-                      )
+                      Diagnostic(
+                        "cancel-requested",
+                        "cancelled by the submitter before any pilot claimed the " +
+                          "invocation; execution requires a claim, so it provably never ran"
+                      ),
+                      Vector.empty
                     )
                   case Left(claimFailure) =>
                     recordTask(
                       task,
                       Diagnostic(
                         "cancel-undeliverable",
-                        s"${describeClaim(claimFailure)}; the invocation is already dispatched " +
+                        s"${SpoolEvidence.describeClaim(claimFailure)}; the invocation is already dispatched " +
                           "— the outcome still arrives through await"
                       )
                     )
@@ -513,7 +522,7 @@ object PoolDispatcher:
                   (
                     None,
                     Some(
-                      Diagnostic("pilot-registration-unreadable", describeIntegrity(failure))
+                      Diagnostic("pilot-registration-unreadable", failure.describe)
                     )
                   )
               }
@@ -522,7 +531,7 @@ object PoolDispatcher:
             case Left(failure) =>
               (
                 previous.heartbeat,
-                Some(Diagnostic("pilot-heartbeat-unreadable", describeIntegrity(failure)))
+                Some(Diagnostic("pilot-heartbeat-unreadable", failure.describe))
               )
           }
           liveness <- observer.observe(pilot)
@@ -561,7 +570,7 @@ object PoolDispatcher:
           val track = tracks.getOrElse(pilot, PilotTrack.initial)
           spool.claimedEntries(pilot).flatMap {
             case Left(failure) =>
-              recordScan(Diagnostic("claimed-scan-failed", describeIntegrity(failure)))
+              recordScan(Diagnostic("claimed-scan-failed", failure.describe))
             case Right(entries) =>
               entries.traverse_ { file =>
                 track.liveness match
@@ -622,7 +631,7 @@ object PoolDispatcher:
       config.pilots.traverse_ { pilot =>
         spool.reclaimedEntries(pilot).flatMap {
           case Left(failure) =>
-            recordScan(Diagnostic("tombstone-scan-failed", describeIntegrity(failure)))
+            recordScan(Diagnostic("tombstone-scan-failed", failure.describe))
           case Right(entries) =>
             entries.traverse_ { tombstone =>
               val marker = s"${pilot.value}/${tombstone.getFileName}"
@@ -654,12 +663,12 @@ object PoolDispatcher:
               // Unreadable tombstone: cannot attribute or gate retry. Keep the evidence; the
               // handle resolves at revocation (honestly Unknown). Retry reads until then in case
               // the fault is transient — reads never settle anything.
-              recordScan(Diagnostic("tombstone-unreadable", describeIntegrity(failure)))
+              recordScan(Diagnostic("tombstone-unreadable", failure.describe))
             case Right(invocation) =>
               spool.verifyInvocationBinding(tombstone, parsed, invocation) match
                 case Left(mismatch) =>
                   recordScan(
-                    Diagnostic("tombstone-binding-mismatch", describeIntegrity(mismatch))
+                    Diagnostic("tombstone-binding-mismatch", mismatch.describe)
                   ) *> markResolved(marker)
                 case Right(()) =>
                   state.tasks.get.map(_.get(invocation.key)).flatMap {
@@ -674,8 +683,16 @@ object PoolDispatcher:
                           task.epoch.get.flatMap { currentEpoch =>
                             if parsed.epoch != currentEpoch then
                               // A tombstone from a superseded epoch: the bump already happened
-                              // (possibly in a previous dispatcher incarnation).
-                              markResolved(marker)
+                              // (possibly in a previous dispatcher incarnation). P2 promises the
+                              // superseded observation is recorded as evidence, never acted on.
+                              recordTaskOnce(
+                                task,
+                                Diagnostic(
+                                  "superseded",
+                                  s"tombstone $marker carries epoch e${parsed.epoch.value}, " +
+                                    s"superseded by current epoch e${currentEpoch.value}"
+                                )
+                              ) *> markResolved(marker)
                             else
                               resolveTombstone(
                                 pilot,
@@ -738,7 +755,7 @@ object PoolDispatcher:
               ) *> markResolved(marker)
         case Left(failure) =>
           // A result-read failure never settles or advances anything; hold and retry.
-          recordTask(task, Diagnostic("reclaim-result-check-failed", describeIntegrity(failure)))
+          recordTask(task, Diagnostic("reclaim-result-check-failed", failure.describe))
       }
 
     private def bumpEpoch(
@@ -771,7 +788,7 @@ object PoolDispatcher:
               // The bump did not happen; the tombstone stays live and is retried next cycle.
               recordTask(
                 task,
-                Diagnostic("retry-republish-failed", describeWrite(writeFailure))
+                Diagnostic("retry-republish-failed", SpoolEvidence.describeWrite(writeFailure))
               )
           }
 
@@ -800,35 +817,27 @@ object PoolDispatcher:
           case PilotLiveness.Terminal(evidence) =>
             // E1 evidence: termination was observed. Interrupted claims termination before a
             // result — never that side effects did not occur.
-            settle(
+            settleInterrupted(
               task,
-              TaskOutcome.Interrupted(
-                diags(
-                  Diagnostic("pilot-terminal", s"${evidence.code}: ${evidence.message}"),
-                  shared :+ Diagnostic(
-                    "side-effects-indeterminate",
-                    "the pilot may have executed between claim and publish; only the absence " +
-                      "of a published result is known"
-                  )
-                )
+              Diagnostic("pilot-terminal", s"${evidence.code}: ${evidence.message}"),
+              shared :+ Diagnostic(
+                "side-effects-indeterminate",
+                "the pilot may have executed between claim and publish; only the absence " +
+                  "of a published result is known"
               )
             )
           case PilotLiveness.Unobservable(detail) =>
             // E4 evidence: death was inferred from the walltime bound, never observed.
-            settle(
+            settleUnknownWith(
               task,
-              TaskOutcome.Unknown(
-                diags(
-                  Diagnostic(
-                    "pilot-death-inferred",
-                    s"backend unobservable ($detail); reclaimed past " +
-                      "registration.deadline + drainGrace + skew budget"
-                  ),
-                  shared :+ Diagnostic(
-                    "side-effects-indeterminate",
-                    "no observation of the pilot's fate exists; the work may have run"
-                  )
-                )
+              Diagnostic(
+                "pilot-death-inferred",
+                s"backend unobservable ($detail); reclaimed past " +
+                  "registration.deadline + drainGrace + skew budget"
+              ),
+              shared :+ Diagnostic(
+                "side-effects-indeterminate",
+                "no observation of the pilot's fate exists; the work may have run"
               )
             )
           case PilotLiveness.Running =>
@@ -856,7 +865,7 @@ object PoolDispatcher:
               case Left(failure)       =>
                 // Integrity failures on the result plane are quarantined evidence: the handle
                 // never settles from an artifact that does not verify.
-                recordTaskOnce(task, Diagnostic("result-integrity", describeIntegrity(failure)))
+                recordTaskOnce(task, Diagnostic("result-integrity", failure.describe))
             }
           }
         }
@@ -874,7 +883,7 @@ object PoolDispatcher:
                 task,
                 Diagnostic(
                   "result-object-unverified",
-                  ("settle blocked" +: storeFailureCodes(storeFailure)).mkString(";")
+                  ("settle blocked" +: SpoolEvidence.storeFailureCodes(storeFailure)).mkString(";")
                 )
               )
             case Right(_) =>
@@ -888,29 +897,21 @@ object PoolDispatcher:
                   )
           }
         case SpoolResultStatus.Failed(code, message) =>
-          settle(
+          // The observed message travels as a confirmed contributor — WorkerFailure carries
+          // only the stable code.
+          settleFailed(
             task,
-            TaskOutcome.Failed(
-              FailureDiagnosis(
-                FailureCause.WorkerFailure(code),
-                // The observed message travels as a confirmed contributor — WorkerFailure
-                // carries only the stable code.
-                Vector(FailureCause.ProgramFailed(None, Vector(message))),
-                Vector.empty
-              )
-            )
+            FailureCause.WorkerFailure(code),
+            Vector(FailureCause.ProgramFailed(None, Vector(message)))
           )
         case SpoolResultStatus.Interrupted(reason, detail) =>
-          settle(
+          settleInterrupted(
             task,
-            TaskOutcome.Interrupted(
-              diags(
-                Diagnostic(
-                  "pilot-interrupted",
-                  s"${interruptReasonText(reason)}: $detail (pilot ${result.pilot.value})"
-                )
-              )
-            )
+            Diagnostic(
+              "pilot-interrupted",
+              s"${interruptReasonText(reason)}: $detail (pilot ${result.pilot.value})"
+            ),
+            Vector.empty
           )
 
     // ─── phase derivation ────────────────────────────────────────────────────
@@ -931,9 +932,9 @@ object PoolDispatcher:
           case (_, Left(_))          => Vector.empty
         }.toMap
         scanFailures = pendingListing.left.toSeq.toVector.map(failure =>
-          Diagnostic("pending-scan-failed", describeIntegrity(failure))
+          Diagnostic("pending-scan-failed", failure.describe)
         ) ++ claimedListing.collect { case (pilot, Left(failure)) =>
-          Diagnostic(s"claimed-scan-failed", s"${pilot.value}: ${describeIntegrity(failure)}")
+          Diagnostic(s"claimed-scan-failed", s"${pilot.value}: ${failure.describe}")
         }
         _ <- tasks.traverse_ { task =>
           task.epoch.get.flatMap { epoch =>
@@ -1110,7 +1111,9 @@ object PoolDispatcher:
       spool.writeDrain(SpoolDrain(tick, reason)).flatMap {
         case Right(())          => state.drainWritten.set(true)
         case Left(writeFailure) =>
-          recordScan(Diagnostic("drain-marker-write-failed", describeWrite(writeFailure)))
+          recordScan(
+            Diagnostic("drain-marker-write-failed", SpoolEvidence.describeWrite(writeFailure))
+          )
       }
 
     // ─── revocation and release ──────────────────────────────────────────────
@@ -1125,28 +1128,50 @@ object PoolDispatcher:
     ): IO[Unit] =
       claimTerminal(LeaseEvent.Revoked(reason)).flatMap {
         case false => IO.unit
-        case true  =>
-          for
-            _ <- state.closed.set(true)
-            _ <- now.flatMap(tick => writeDrain(drainReason, tick))
-            _ <- settleSweep(sweepCode)
-            _ <- emitTerminal(LeaseEvent.Revoked(reason))
-          yield ()
+        case true  => finishTerminal(LeaseEvent.Revoked(reason), sweepCode, drainReason)
       }
+
+    /** Complete a claimed terminal transition. Uncancelable — the ADR's "exactly one terminal
+      * Revoked … onRevoked completes in the same transition" is a completion guarantee, and this
+      * sequence may run on the scan fiber, which the release path cancels first. Every step is
+      * idempotent (monotone marker, Deferred-guarded settles, closed-topic publish), so a
+      * transition interrupted by outright process death is finished by the next caller that
+      * observes the claimed terminal — [[release]] does exactly that.
+      */
+    private def finishTerminal(
+        event: LeaseEvent.Revoked,
+        sweepCode: String,
+        drainReason: SpoolDrainReason
+    ): IO[Unit] =
+      IO.uncancelable { _ =>
+        state.closed.set(true) *>
+          now.flatMap(tick => writeDrain(drainReason, tick)) *>
+          settleSweep(sweepCode) *>
+          emitTerminal(event)
+      }
+
+    private def sweepCodeFor(event: LeaseEvent.Revoked): String = event.reason match
+      case LeaseRevocation.Expired   => "walltime-deadline"
+      case LeaseRevocation.Cancelled => "pool-released"
+      case LeaseRevocation.Lost(_)   => "lease-lost"
+
+    private def drainReasonFor(event: LeaseEvent.Revoked): SpoolDrainReason = event.reason match
+      case LeaseRevocation.Expired   => SpoolDrainReason.Deadline
+      case LeaseRevocation.Cancelled => SpoolDrainReason.Released
+      case LeaseRevocation.Lost(_)   => SpoolDrainReason.Manual
 
     /** The release finalizer, in exactly the ADR's order: marker → bounded quiesce → settle open
       * handles → cancel the backend → Revoked(Cancelled) → retain the spool root as evidence.
+      *
+      * If the lease already revoked itself (Expired / Lost) — or a scan-fiber revocation was
+      * cancelled mid-transition — release idempotently FINISHES that transition before cancelling
+      * the backend, so `onRevoked`, `events` termination, and handle settlement hold on every path.
       */
     def release: IO[Unit] =
-      state.closed.set(true) *> state.terminal.get.flatMap {
-        case Some(_) =>
-          // The lease already revoked itself (Expired / Lost). Ensure the marker exists and the
-          // backend allocation is cancelled; both are idempotent.
-          now.flatMap(tick => writeDrain(SpoolDrainReason.Released, tick)) *> cancelBackend.void
-        case None =>
+      IO.uncancelable { _ =>
+        state.closed.set(true) *>
           claimTerminal(LeaseEvent.Revoked(LeaseRevocation.Cancelled)).flatMap {
-            case false => cancelBackend.void
-            case true  =>
+            case true =>
               for
                 tick <- now
                 _ <- writeDrain(SpoolDrainReason.Released, tick)
@@ -1172,6 +1197,16 @@ object PoolDispatcher:
                   else IO.unit
                 _ <- emitTerminal(LeaseEvent.Revoked(LeaseRevocation.Cancelled))
               yield ()
+            case false =>
+              state.terminal.get.flatMap {
+                case Some(event) =>
+                  finishTerminal(event, sweepCodeFor(event), drainReasonFor(event)) *>
+                    cancelBackend.void
+                case None =>
+                  // Unreachable: losing the terminal claim implies a recorded terminal. Cancel
+                  // the backend regardless — never leave an allocation behind.
+                  cancelBackend.void
+              }
           }
       }
 
@@ -1245,7 +1280,7 @@ object PoolDispatcher:
           case Left(failure) =>
             recordTaskOnce(
               task,
-              Diagnostic("result-integrity", describeIntegrity(failure))
+              Diagnostic("result-integrity", failure.describe)
             ).as(false)
         }
       }
@@ -1261,17 +1296,14 @@ object PoolDispatcher:
         case Right(pendingFile) =>
           spool.claimInto(pendingFile, spool.paths.poolReclaimed).flatMap {
             case Right(_) =>
-              settle(
+              settleInterrupted(
                 task,
-                TaskOutcome.Interrupted(
-                  diags(
-                    Diagnostic(
-                      reasonCode,
-                      "the pool revoked while the invocation was still unclaimed; execution " +
-                        "requires a claim, so it provably never ran"
-                    )
-                  )
-                )
+                Diagnostic(
+                  reasonCode,
+                  "the pool revoked while the invocation was still unclaimed; execution " +
+                    "requires a claim, so it provably never ran"
+                ),
+                Vector.empty
               ).as(true)
             case Left(AtomicFiles.ClaimFailure.SourceMissing(_))            => IO.pure(false)
             case Left(AtomicFiles.ClaimFailure.AlreadyClaimed(destination)) =>
@@ -1311,13 +1343,13 @@ object PoolDispatcher:
     private def publish(event: LeaseEvent): IO[Unit] =
       state.topic.publish1(event).void
 
-    private def claimTerminal(event: LeaseEvent): IO[Boolean] =
+    private def claimTerminal(event: LeaseEvent.Revoked): IO[Boolean] =
       state.terminal.modify {
         case None => (Some(event), true)
         case some => (some, false)
       }
 
-    private def emitTerminal(event: LeaseEvent): IO[Unit] =
+    private def emitTerminal(event: LeaseEvent.Revoked): IO[Unit] =
       publish(event) *> state.topic.close.void *> state.revoked.complete(()).void
 
     // ─── small helpers ───────────────────────────────────────────────────────
@@ -1326,6 +1358,50 @@ object PoolDispatcher:
       state.tasks.get.flatMap {
         _.values.toVector.filterA(task => task.outcome.tryGet.map(_.isEmpty))
       }
+
+    /** Settle `Failed` with the accumulated task evidence merged into the diagnosis's confirmed
+      * contributors (each diagnostic as a `RuntimeError` cause — the only generic text carrier the
+      * cause vocabulary offers). No collected evidence is dropped on a failure settlement.
+      */
+    private def settleFailed(
+        task: PoolTask,
+        primary: FailureCause,
+        confirmed: Vector[FailureCause]
+    ): IO[Unit] =
+      task.evidence.get.flatMap { collected =>
+        settle(
+          task,
+          TaskOutcome.Failed(
+            FailureDiagnosis(
+              primary,
+              confirmed ++ collected.map(diagnostic =>
+                FailureCause.RuntimeError(s"${diagnostic.code}: ${diagnostic.message}")
+              ),
+              Vector.empty
+            )
+          )
+        )
+      }
+
+    /** Settle `Interrupted` with the accumulated task evidence appended to the diagnostics. */
+    private def settleInterrupted(
+        task: PoolTask,
+        first: Diagnostic,
+        rest: Vector[Diagnostic]
+    ): IO[Unit] =
+      task.evidence.get.flatMap(collected =>
+        settle(task, TaskOutcome.Interrupted(diags(first, rest ++ collected)))
+      )
+
+    /** Settle `Unknown` with the accumulated task evidence appended to the diagnostics. */
+    private def settleUnknownWith(
+        task: PoolTask,
+        first: Diagnostic,
+        rest: Vector[Diagnostic]
+    ): IO[Unit] =
+      task.evidence.get.flatMap(collected =>
+        settle(task, TaskOutcome.Unknown(diags(first, rest ++ collected)))
+      )
 
     private def settle(task: PoolTask, outcome: TaskOutcome[Nothing]): IO[Unit] =
       task.outcome.complete(outcome).flatMap {
@@ -1363,39 +1439,6 @@ object PoolDispatcher:
       case OperationRunFailure.InvalidInput(detail)     => detail
       case OperationRunFailure.Execution(code, message) => s"$code: $message"
       case OperationRunFailure.InvalidResult(detail)    => detail
-
-    private def describeWrite(failure: AtomicFiles.WriteFailure): String = failure match
-      case AtomicFiles.WriteFailure.TargetExists(path)           => s"target exists: $path"
-      case AtomicFiles.WriteFailure.TargetConflict(path, detail) => s"conflict at $path: $detail"
-      case AtomicFiles.WriteFailure.AtomicMoveUnavailable(path)  =>
-        s"atomic move unavailable: $path"
-      case AtomicFiles.WriteFailure.Io(detail) => detail
-
-    private def describeClaim(failure: AtomicFiles.ClaimFailure): String = failure match
-      case AtomicFiles.ClaimFailure.SourceMissing(from)         => s"source missing: $from"
-      case AtomicFiles.ClaimFailure.AlreadyClaimed(to)          => s"already claimed: $to"
-      case AtomicFiles.ClaimFailure.SourceNotRegular(from)      => s"source not regular: $from"
-      case AtomicFiles.ClaimFailure.AtomicMoveUnavailable(from) =>
-        s"atomic move unavailable: $from"
-      case AtomicFiles.ClaimFailure.Io(detail) => detail
-
-    private def describeIntegrity(failure: SpoolIntegrityFailure): String = failure match
-      case SpoolIntegrityFailure.Missing(path)                   => s"missing: $path"
-      case SpoolIntegrityFailure.Unreadable(path, detail)        => s"unreadable $path: $detail"
-      case SpoolIntegrityFailure.Undecodable(path, codecFailure) =>
-        s"undecodable $path: $codecFailure"
-      case SpoolIntegrityFailure.BindingMismatch(path, token, epoch, bodyKey, bodyEpoch) =>
-        s"binding mismatch at $path: filename ($token, e${epoch.value}) vs body " +
-          s"(key '${bodyKey.value}', e${bodyEpoch.value})"
-
-    private def storeFailureCodes(failure: StoreFailure): Vector[String] = failure match
-      case StoreFailure.NotFound(path)                           => Vector("not-found", path.value)
-      case StoreFailure.DigestMismatch(path, expected, observed) =>
-        Vector("digest-mismatch", path.value, expected.value, observed.value)
-      case StoreFailure.Decode(codecFailure) =>
-        Vector("decode", codecFailure.code, codecFailure.message)
-      case StoreFailure.Io(diagnostics) =>
-        diagnostics.toVector.flatMap(diagnostic => Vector(diagnostic.code, diagnostic.message))
 
     private def retrySafetyText(value: RetrySafety): String = value match
       case RetrySafety.Unknown               => "unknown"

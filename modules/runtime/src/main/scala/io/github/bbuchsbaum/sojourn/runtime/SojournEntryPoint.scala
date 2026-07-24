@@ -2,6 +2,7 @@ package io.github.bbuchsbaum.sojourn.runtime
 
 import cats.effect.ExitCode
 import cats.effect.IO
+import cats.effect.std.Console
 import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
 import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
 import io.github.bbuchsbaum.scalaslurm.protocol.TaskInvocationCodec
@@ -13,6 +14,7 @@ import io.github.bbuchsbaum.scalaslurm.worker.WorkerRunResult
 import io.github.bbuchsbaum.scalaslurm.worker.WorkerRuntime
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoop
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoopConfig
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotStopCause
 import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolFiles
 import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolPaths
 import io.github.bbuchsbaum.sojourn.spool.PilotId
@@ -136,11 +138,26 @@ object SojournEntryPoint:
                     store
                   )
                   code <- outcome match
-                    case Right(_)    => IO.pure(ExitCode.Success)
+                    case Right(report) =>
+                      // The report is the pilot's honest exit evidence — surface it, don't drop it.
+                      IO.println(
+                        s"sojourn pilot ${arguments.pilot.value}: drained " +
+                          s"(${describeStop(report.stopCause)}) after ${report.executed} " +
+                          s"executions; ${report.evidence.size} retained diagnostics" +
+                          report.evidence
+                            .map(diagnostic => s"\n  ${diagnostic.code}: ${diagnostic.message}")
+                            .mkString
+                      ).as(ExitCode.Success)
                     case Left(fatal) =>
-                      IO.println(s"sojourn pilot: fatal: $fatal").as(ExitCode.Error)
+                      Console[IO]
+                        .errorln(s"sojourn pilot: fatal: ${fatal.describe}")
+                        .as(ExitCode.Error)
                 yield code
             }
+
+  private def describeStop(cause: PilotStopCause): String = cause match
+    case PilotStopCause.DrainMarkerObserved => "drain marker observed"
+    case PilotStopCause.DeadlineReached     => "deadline reached"
 
   def oneShot(
       arguments: OneShotArguments,

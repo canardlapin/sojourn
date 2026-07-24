@@ -5,6 +5,7 @@ import cats.effect.Resource
 import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
 import io.github.bbuchsbaum.sojourn.LeaseEvent
 import io.github.bbuchsbaum.sojourn.LeaseRevocation
+import io.github.bbuchsbaum.sojourn.LeaseState.awaitGranted
 import io.github.bbuchsbaum.sojourn.LeasedPool
 import io.github.bbuchsbaum.sojourn.SubmitRejection
 import io.github.bbuchsbaum.sojourn.TaskInput
@@ -46,15 +47,13 @@ abstract class PoolTck extends CatsEffectSuite:
   test("law P1: pool acquisition grants within a generous bound") {
     val (_, pool) = poolFixture()
     for
-      granted <- pool.lease.events
-        .collectFirst { case LeaseEvent.Granted(ready) => ready }
-        .compile
-        .lastOrError
-        .timeout(2.minutes)
+      granted <- pool.lease.awaitGranted.timeout(2.minutes)
       ready <- pool.lease.ready
       _ <- pool.lease.deadline // observable without error
     yield
-      assert(granted.value >= 1, s"Granted with ready=${granted.value}")
+      granted match
+        case Right(readyCount) => assert(readyCount.value >= 1, s"granted at $readyCount ready")
+        case Left(revocation)  => fail(s"expected a grant, observed revocation $revocation")
       assert(ready.value >= 0)
   }
 

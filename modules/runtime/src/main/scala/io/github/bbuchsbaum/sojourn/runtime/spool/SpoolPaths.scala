@@ -51,6 +51,17 @@ enum SpoolIntegrityFailure derives CanEqual:
       bodyEpoch: AttemptEpoch
   )
 
+  /** One canonical human-readable rendering, used by every diagnostic that carries this failure —
+    * hoisted here so the rendering cannot drift between the pilot, dispatcher, and backends.
+    */
+  def describe: String = this match
+    case Missing(path)                                           => s"missing: $path"
+    case Unreadable(path, detail)                                => s"unreadable $path: $detail"
+    case Undecodable(path, reason)                               => s"undecodable $path: $reason"
+    case BindingMismatch(path, token, epoch, bodyKey, bodyEpoch) =>
+      s"binding mismatch at $path: filename ($token, e${epoch.value}) vs body " +
+        s"(key '${bodyKey.value}', e${bodyEpoch.value})"
+
 /** How a result publication concluded: [[AlreadyPublished]] is typed and non-fatal — the published
   * result stands (invariant I2 admits exactly one result file per (key, epoch)).
   */
@@ -116,7 +127,11 @@ object SpoolPaths:
       results <- relative(SpoolLayout.resultsDir)
       drain <- relative(SpoolLayout.drainMarker)
       poolReclaimed <- relative(SpoolLayout.poolReclaimedDir)
-      pilots = manifest.getParent.resolve("pilots")
+      // The pilots directory has no direct SpoolLayout entry; derive it as the parent of a probe
+      // registration file so the segment still comes from the layout, never a local literal.
+      probe <- PilotId.from("probe")
+      probeRegistration <- relative(SpoolLayout.registrationFile(_, probe))
+      pilots = probeRegistration.getParent
     yield new SpoolPaths(root, anchor, manifest, pending, results, pilots, drain, poolReclaimed)
 
 /** Effectful spool primitives over one pool's [[SpoolPaths]].
@@ -271,18 +286,29 @@ final class SpoolFiles[F[_]: Sync](
     */
   def publishResult(result: SpoolResult): F[Either[AtomicFiles.WriteFailure, ResultPublication]] =
     val token = KeyToken.forKey(result.key)
-    paths.resultFile(token.value, result.attemptEpoch) match
-      case Left(failure) => pathFailure(failure)
-      case Right(target) =>
-        Sync[F].blocking {
-          AtomicFiles.publishOnceBlocking(target, SpoolCodec.encodeResult(result)) match
-            case Right(_) => Right(ResultPublication.Published)
-            case Left(AtomicFiles.WriteFailure.TargetExists(_)) =>
-              Right(ResultPublication.AlreadyPublished)
-            case Left(other: AtomicFiles.WriteFailure.TargetConflict)        => Left(other)
-            case Left(other: AtomicFiles.WriteFailure.AtomicMoveUnavailable) => Left(other)
-            case Left(other: AtomicFiles.WriteFailure.Io)                    => Left(other)
-        }
+    val bytes = SpoolCodec.encodeResult(result)
+    if bytes.size.toLong > maximumArtifactBytes.value.toLong then
+      Sync[F].pure(
+        Left(
+          AtomicFiles.WriteFailure.Io(
+            s"result envelope of ${bytes.size} bytes exceeds the " +
+              s"${maximumArtifactBytes.value}-byte envelope ceiling"
+          )
+        )
+      )
+    else
+      paths.resultFile(token.value, result.attemptEpoch) match
+        case Left(failure) => pathFailure(failure)
+        case Right(target) =>
+          Sync[F].blocking {
+            AtomicFiles.publishOnceBlocking(target, bytes) match
+              case Right(_) => Right(ResultPublication.Published)
+              case Left(AtomicFiles.WriteFailure.TargetExists(_)) =>
+                Right(ResultPublication.AlreadyPublished)
+              case Left(other: AtomicFiles.WriteFailure.TargetConflict)        => Left(other)
+              case Left(other: AtomicFiles.WriteFailure.AtomicMoveUnavailable) => Left(other)
+              case Left(other: AtomicFiles.WriteFailure.Io)                    => Left(other)
+          }
 
   /** Targeted result check for (`keyToken`, `epoch`): absence is `None` (the ordinary state while
     * work is in flight). A present envelope is verified against the filename token, the filename
@@ -333,10 +359,15 @@ final class SpoolFiles[F[_]: Sync](
         case Left(other: AtomicFiles.WriteFailure.Io)                    => Left(other)
     }
 
-  def drainRequested: F[Boolean] =
+  /** Whether the drain marker exists. An unreadable spool must never silently read as "not
+    * draining" — the failure is typed evidence for the caller to record.
+    */
+  def drainRequested: F[Either[SpoolIntegrityFailure, Boolean]] =
     Sync[F].blocking {
-      try JFiles.exists(paths.drainMarker, LinkOption.NOFOLLOW_LINKS)
-      catch case NonFatal(_) => false
+      try Right(JFiles.exists(paths.drainMarker, LinkOption.NOFOLLOW_LINKS))
+      catch
+        case NonFatal(error) =>
+          Left(SpoolIntegrityFailure.Unreadable(paths.drainMarker.toString, describe(error)))
     }
 
   def readDrain: F[Either[SpoolIntegrityFailure, Option[SpoolDrain]]] =

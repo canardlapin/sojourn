@@ -27,7 +27,6 @@ import io.github.bbuchsbaum.sojourn.runtime.OperationRunFailure
 import io.github.bbuchsbaum.sojourn.runtime.PreflightFailure
 import io.github.bbuchsbaum.sojourn.runtime.RegisteredOperation
 import io.github.bbuchsbaum.sojourn.runtime.SitePreflight
-import io.github.bbuchsbaum.sojourn.runtime.spool.PilotFatal
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLiveness
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoop
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoopConfig
@@ -36,8 +35,8 @@ import io.github.bbuchsbaum.sojourn.runtime.spool.PilotReport
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotStopCause
 import io.github.bbuchsbaum.sojourn.runtime.spool.PoolDispatcher
 import io.github.bbuchsbaum.sojourn.runtime.spool.PoolDispatcherConfig
+import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolEvidence
 import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolFiles
-import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolIntegrityFailure
 import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolPaths
 import io.github.bbuchsbaum.sojourn.spool.PilotId
 import io.github.bbuchsbaum.sojourn.spool.PoolManifest
@@ -143,9 +142,11 @@ object LocalSite:
         poolId <- Resource.eval(mintPoolId)
         spoolRoot = config.root.resolve(spec.spoolRoot.value).resolve(poolId.value)
         paths <- Resource.eval(orRaise(SpoolPaths.at(spoolRoot)))
-        spool = new SpoolFiles[IO](paths)
-        _ <- Resource.eval(spool.initialize.flatMap(orRaiseWrite))
+        _ <- Resource.eval(new SpoolFiles[IO](paths).initialize.flatMap(orRaiseWrite))
         limits <- Resource.eval(orRaise(spoolLimits))
+        // All spool IO from here on is bounded by the pool's own envelope ceiling — the same
+        // value the manifest publishes for the pilots to enforce.
+        spool = new SpoolFiles[IO](paths, limits.maximumEnvelopeBytes)
         manifest = PoolManifest(
           poolId,
           name,
@@ -203,7 +204,7 @@ object LocalSite:
             result.flatMap {
               case Left(fatal) =>
                 terminals.update(
-                  _.updated(pilotId, Diagnostic("pilot-fatal", describeFatal(fatal)))
+                  _.updated(pilotId, Diagnostic("pilot-fatal", fatal.describe))
                 )
               case Right(report) =>
                 terminals.update(
@@ -260,33 +261,8 @@ object LocalSite:
 
     private def orRaiseWrite(either: Either[AtomicFiles.WriteFailure, Unit]): IO[Unit] =
       IO.fromEither(
-        either.left.map(failure => new LocalPoolUnavailable(describeWriteFailure(failure)))
+        either.left.map(failure => new LocalPoolUnavailable(SpoolEvidence.describeWrite(failure)))
       )
-
-    private def describeWriteFailure(failure: AtomicFiles.WriteFailure): String = failure match
-      case AtomicFiles.WriteFailure.TargetExists(path)           => s"target exists: $path"
-      case AtomicFiles.WriteFailure.TargetConflict(path, detail) => s"conflict at $path: $detail"
-      case AtomicFiles.WriteFailure.AtomicMoveUnavailable(path)  =>
-        s"atomic move unavailable: $path"
-      case AtomicFiles.WriteFailure.Io(detail) => detail
-
-    private def describeFatal(fatal: PilotFatal): String = fatal match
-      case PilotFatal.SpoolInvalid(detail)         => s"spool invalid: $detail"
-      case PilotFatal.ManifestUnavailable(failure) =>
-        s"manifest unavailable: ${describeIntegrity(failure)}"
-      case PilotFatal.AlreadyRegistered(pilot)    => s"pilot id ${pilot.value} already registered"
-      case PilotFatal.RegistrationFailed(detail)  => s"registration failed: $detail"
-      case PilotFatal.AtomicMoveUnavailable(path) => s"atomic move unavailable: $path"
-      case PilotFatal.ResultUnpublishable(detail) => s"result unpublishable: $detail"
-
-    private def describeIntegrity(failure: SpoolIntegrityFailure): String = failure match
-      case SpoolIntegrityFailure.Missing(path)                   => s"missing: $path"
-      case SpoolIntegrityFailure.Unreadable(path, detail)        => s"unreadable $path: $detail"
-      case SpoolIntegrityFailure.Undecodable(path, codecFailure) =>
-        s"undecodable $path: $codecFailure"
-      case SpoolIntegrityFailure.BindingMismatch(path, token, epoch, bodyKey, bodyEpoch) =>
-        s"binding mismatch at $path: filename ($token, e${epoch.value}) vs body " +
-          s"(key '${bodyKey.value}', e${bodyEpoch.value})"
 
     private def describeReport(report: PilotReport): String =
       val cause = report.stopCause match

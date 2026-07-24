@@ -1,6 +1,9 @@
 package io.github.bbuchsbaum.sojourn
 
+import cats.effect.kernel.Concurrent
+import cats.syntax.all.*
 import fs2.Stream
+import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
 import io.github.bbuchsbaum.scalaslurm.core.Diagnostics
 
 import java.time.Instant
@@ -53,3 +56,38 @@ trait LeaseState[F[_]]:
 
   /** Completes once, at the moment the lease becomes revoked. */
   def onRevoked: F[Unit]
+
+object LeaseState:
+  extension [F[_]: Concurrent](lease: LeaseState[F])
+    /** The first grant-or-revocation transition: completes with the ready count once the lease
+      * first reaches (or, for a late caller, is already at) its readiness floor, or with the
+      * revocation if the lease terminally revokes without ever granting. Capacity callers gate on
+      * this instead of hand-rolling an [[LeaseState.events]] scan.
+      *
+      * The stream contract guarantees a terminal [[LeaseEvent.Revoked]] before completion; a
+      * backend that completes the stream without one is a contract violation, reported honestly as
+      * a [[LeaseRevocation.Lost]] with that evidence rather than raised.
+      */
+    def awaitGranted: F[Either[LeaseRevocation, PilotCount]] =
+      lease.events
+        .collectFirst[Either[LeaseRevocation, PilotCount]] {
+          case LeaseEvent.Granted(ready)  => Right(ready)
+          case LeaseEvent.Revoked(reason) => Left(reason)
+        }
+        .compile
+        .last
+        .map {
+          case Some(outcome) => outcome
+          case None          =>
+            Left(
+              LeaseRevocation.Lost(
+                Diagnostics.one(
+                  Diagnostic(
+                    "lease-events-completed-without-terminal",
+                    "the events stream completed without a Granted or Revoked transition — " +
+                      "a backend contract violation"
+                  )
+                )
+              )
+            )
+        }

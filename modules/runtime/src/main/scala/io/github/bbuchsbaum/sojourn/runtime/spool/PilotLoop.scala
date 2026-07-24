@@ -69,6 +69,15 @@ enum PilotFatal derives CanEqual:
     */
   case ResultUnpublishable(detail: String)
 
+  /** Canonical rendering for backend diagnostics and the binary edge. */
+  def describe: String = this match
+    case SpoolInvalid(detail)         => s"spool invalid: $detail"
+    case ManifestUnavailable(failure) => s"manifest unavailable: ${failure.describe}"
+    case AlreadyRegistered(pilot)     => s"pilot id ${pilot.value} already registered"
+    case RegistrationFailed(detail)   => s"registration failed: $detail"
+    case AtomicMoveUnavailable(path)  => s"atomic move unavailable: $path"
+    case ResultUnpublishable(detail)  => s"result unpublishable: $detail"
+
 /** Why the pilot stopped claiming. */
 enum PilotStopCause derives CanEqual:
   case DrainMarkerObserved
@@ -103,16 +112,20 @@ object PilotLoop:
       case Left(failure) =>
         IO.pure(Left(PilotFatal.SpoolInvalid(s"${failure.field}: ${failure.reason}")))
       case Right(paths) =>
-        val spool = new SpoolFiles[IO](paths)
+        // Bootstrap SpoolFiles reads the manifest under the stack-wide ceiling; once the manifest
+        // is known, all further spool IO is bounded by ITS envelope ceiling (the dispatcher and
+        // pilots then provably enforce the same limits, per SpoolLimits' contract).
+        val bootstrap = new SpoolFiles[IO](paths)
         (paths.claimedDir(config.pilot), paths.doneDir(config.pilot)) match
           case (Left(failure), _) =>
             IO.pure(Left(PilotFatal.SpoolInvalid(s"${failure.field}: ${failure.reason}")))
           case (_, Left(failure)) =>
             IO.pure(Left(PilotFatal.SpoolInvalid(s"${failure.field}: ${failure.reason}")))
           case (Right(claimedDir), Right(doneDir)) =>
-            spool.readManifest.flatMap {
+            bootstrap.readManifest.flatMap {
               case Left(failure)   => IO.pure(Left(PilotFatal.ManifestUnavailable(failure)))
               case Right(manifest) =>
+                val spool = new SpoolFiles[IO](paths, manifest.limits.maximumEnvelopeBytes)
                 register(config, spool).flatMap {
                   case Left(fatal) => IO.pure(Left(fatal))
                   case Right(())   =>
@@ -198,7 +211,10 @@ object PilotLoop:
           _ <- written match
             case Right(())     => IO.unit
             case Left(failure) =>
-              record(Diagnostic("pilot-heartbeat-write-failed", describeWrite(failure)))
+              recordOnce(
+                "heartbeat-write-failed",
+                Diagnostic("pilot-heartbeat-write-failed", SpoolEvidence.describeWrite(failure))
+              )
         yield ()
       }
 
@@ -217,12 +233,21 @@ object PilotLoop:
 
     private def stopCause: IO[Option[PilotStopCause]] =
       spool.drainRequested.flatMap {
-        case true  => IO.pure(Some(PilotStopCause.DrainMarkerObserved))
-        case false =>
-          config.now.map { now =>
-            val stopAt = config.deadline.minusMillis(manifest.drainGrace.value)
-            if now.isBefore(stopAt) then None else Some(PilotStopCause.DeadlineReached)
-          }
+        case Right(true)   => IO.pure(Some(PilotStopCause.DrainMarkerObserved))
+        case Right(false)  => deadlineStop
+        case Left(failure) =>
+          // An unreadable marker is typed evidence, never a silent "not draining"; the pilot's
+          // own deadline rule still bounds it.
+          recordOnce(
+            "drain-check-failed",
+            Diagnostic("pilot-drain-check-failed", failure.describe)
+          ) *> deadlineStop
+      }
+
+    private def deadlineStop: IO[Option[PilotStopCause]] =
+      config.now.map { now =>
+        val stopAt = config.deadline.minusMillis(manifest.drainGrace.value)
+        if now.isBefore(stopAt) then None else Some(PilotStopCause.DeadlineReached)
       }
 
     private def claimLoop(executed: Long): IO[Either[PilotFatal, (PilotStopCause, Long)]] =
@@ -231,8 +256,10 @@ object PilotLoop:
         case None        =>
           spool.listPending.flatMap {
             case Left(failure) =>
-              record(Diagnostic("pilot-pending-list-failed", describeIntegrity(failure))) *>
-                IO.sleep(idlePause) *> claimLoop(executed)
+              recordOnce(
+                "pending-list-failed",
+                Diagnostic("pilot-pending-list-failed", failure.describe)
+              ) *> IO.sleep(idlePause) *> claimLoop(executed)
             case Right(files) =>
               tryClaims(files).flatMap {
                 case ClaimRound.Fatal(fatal)  => IO.pure(Left(fatal))
@@ -290,25 +317,21 @@ object PilotLoop:
           // via reclaim or revocation — honestly Unknown in the worst case. This is the one
           // deliberate exception to invariant I4, confined to a body no reader could ever bind.
           record(
-            Diagnostic("pilot-claimed-invocation-unreadable", describeIntegrity(failure))
+            Diagnostic("pilot-claimed-invocation-unreadable", failure.describe)
           ) *> releaseClaim(claimedFile)
         case Right(invocation) =>
           spool.verifyInvocationBinding(claimedFile, parsed, invocation) match
             case Left(mismatch) =>
-              // Publish a failed envelope under the body's own (self-consistent) identity with
-              // the integrity diagnostic, then release. The dispatcher's own verification keeps
-              // this envelope from ever settling a handle it does not belong to.
+              // Corruption (race 7): mint NO envelope. Under the filename identity it would
+              // consume the real work's publish-once slot with a lie; under the body identity it
+              // would consume a foreign (key, epoch)'s slot and could mask that submission's
+              // genuine outcome or foreclose its authorized retry. Record the typed evidence and
+              // release the artifact to done/ as retained evidence — the same corruption-confined
+              // I4 exception as an undecodable body; the handle resolves via reclaim or
+              // revocation, worst case honestly Unknown.
               record(
-                Diagnostic("pilot-invocation-binding-mismatch", describeIntegrity(mismatch))
-              ) *> config.now.flatMap { at =>
-                publishAndRelease(
-                  claimedFile,
-                  invocation,
-                  startedAt = at,
-                  finishedAt = at,
-                  SpoolResultStatus.Failed("binding-mismatch", describeIntegrity(mismatch))
-                )
-              }
+                Diagnostic("pilot-invocation-binding-mismatch", mismatch.describe)
+              ) *> releaseClaim(claimedFile)
             case Right(()) =>
               for
                 _ <- setPhase(
@@ -356,7 +379,7 @@ object PilotLoop:
               IO.pure(
                 SpoolResultStatus.Failed(
                   "stored-input-unavailable",
-                  storeFailureCodes(storeFailure).mkString(";")
+                  SpoolEvidence.storeFailureCodes(storeFailure).mkString(";")
                 )
               )
             case Right(bytes) =>
@@ -394,7 +417,7 @@ object PilotLoop:
               case Left(storeFailure) =>
                 SpoolResultStatus.Failed(
                   "result-store-write-failed",
-                  storeFailureCodes(storeFailure).mkString(";")
+                  SpoolEvidence.storeFailureCodes(storeFailure).mkString(";")
                 )
             }
 
@@ -460,31 +483,6 @@ object PilotLoop:
             Diagnostic("pilot-release-io", s"${claimedFile.getFileName}: $detail")
           ).as(Right(()))
       }
-
-    private def describeWrite(failure: AtomicFiles.WriteFailure): String = failure match
-      case AtomicFiles.WriteFailure.TargetExists(path)           => s"target exists: $path"
-      case AtomicFiles.WriteFailure.TargetConflict(path, detail) => s"conflict at $path: $detail"
-      case AtomicFiles.WriteFailure.AtomicMoveUnavailable(path)  =>
-        s"atomic move unavailable: $path"
-      case AtomicFiles.WriteFailure.Io(detail) => detail
-
-    private def describeIntegrity(failure: SpoolIntegrityFailure): String = failure match
-      case SpoolIntegrityFailure.Missing(path)                   => s"missing: $path"
-      case SpoolIntegrityFailure.Unreadable(path, detail)        => s"unreadable $path: $detail"
-      case SpoolIntegrityFailure.Undecodable(path, codecFailure) =>
-        s"undecodable $path: $codecFailure"
-      case SpoolIntegrityFailure.BindingMismatch(path, token, epoch, bodyKey, bodyEpoch) =>
-        s"binding mismatch at $path: filename ($token, e${epoch.value}) vs body " +
-          s"(key '${bodyKey.value}', e${bodyEpoch.value})"
-
-    private def storeFailureCodes(failure: StoreFailure): Vector[String] = failure match
-      case StoreFailure.NotFound(path)                           => Vector("not-found", path.value)
-      case StoreFailure.DigestMismatch(path, expected, observed) =>
-        Vector("digest-mismatch", path.value, expected.value, observed.value)
-      case StoreFailure.Decode(codecFailure) =>
-        Vector("decode", codecFailure.code, codecFailure.message)
-      case StoreFailure.Io(diagnostics) =>
-        diagnostics.toVector.flatMap(diagnostic => Vector(diagnostic.code, diagnostic.message))
 
   private object Station:
     def create(

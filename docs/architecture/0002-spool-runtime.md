@@ -46,7 +46,13 @@
 1. **Claim** `pending/f → claimed/<self>/f`. `SourceMissing`/`AlreadyClaimed` → lost the race,
    next file. `AtomicMoveUnavailable` → fatal typed startup failure for the whole spool.
 2. **Verify** body key/epoch against filename; verify `SpoolInput.Stored` digest before
-   execution. Mismatch → publish a `failed` envelope with the integrity diagnostic, release.
+   execution. A body/filename binding mismatch is corruption (race 7): publish **no** envelope —
+   under the filename identity it would consume the real work's publish-once slot with a lie, and
+   under the body identity it would consume a foreign (key, epoch)'s I2 slot and could mask that
+   submission's genuine outcome or foreclose its authorized retry. Record the typed
+   `BindingMismatch` evidence and release the artifact to `done/` as retained evidence (the same
+   corruption-confined exception to I4 as an undecodable body); the handle resolves via
+   reclaim/revocation, worst case honestly `Unknown`.
 3. **Execute** the registered operation (same `OperationRegistry` as every execution shape).
 4. **Publish result FIRST** — store the success value via `SiteStore.put`-equivalent (success is
    ALWAYS a store reference), then `AtomicFiles.publishOnce` the `SpoolResult` envelope to
@@ -158,7 +164,11 @@ eligibility, heartbeat reads per registered pilot. Status: `Queued` = pending, `
 claimed, `Running` = claimed ∧ fresh heartbeat claims `{key, epoch}`, `Settled` = verified
 result or administrative settlement. Scan IO failures are typed data on freshness
 (`Freshness.Unknown`); handles never settle on a read failure — only on verified settlement,
-quarantined reclaim, or lease revocation (unsettleable ⇒ `Unknown(diagnostics)`).
+quarantined reclaim, or lease revocation (unsettleable ⇒ `Unknown(diagnostics)`). Accumulated
+per-handle evidence (retry disclosures, cancel-delivery failures, integrity observations) is merged
+into every `Failed`/`Interrupted`/`Unknown` settlement's diagnostics; a `Succeeded` outcome carries
+no diagnostics channel by design, so evidence collected on a handle that ultimately succeeds is
+dropped at settlement (it remains observable beforehand through the status/freshness plane).
 
 ## Invariants → enforcing primitives
 
@@ -191,7 +201,8 @@ quarantined reclaim, or lease revocation (unsettleable ⇒ `Unknown(diagnostics)
    the published result settles the handle.
 6. Both epochs publish → the fence admits the current epoch only; a stale success is never used.
 7. keyToken collision / corrupted rename → `BindingMismatch`, artifact quarantined as
-   diagnostics, handle resolves via reclaim/revocation (worst case honestly `Unknown`).
+   diagnostics (released to `done/` with **no** envelope minted under either identity), handle
+   resolves via reclaim/revocation (worst case honestly `Unknown`).
 8. Dispatcher crashes mid-reclaim (after R1, before R3) → the tombstone is durable; on
    attach/restart re-run R2/R3 idempotently (epoch bump is deterministic from the tombstone;
    `pending/…-e{n+1}.inv` uses CREATE_NEW — exists ⇒ already done).
@@ -213,4 +224,7 @@ quarantined reclaim, or lease revocation (unsettleable ⇒ `Unknown(diagnostics)
   `terminationNotice`, `--signal` lowering, worker drain-notice adapter).
 - **`Site.attach` / pool reconstitution** — needs P6f.25 (`SubmissionKey.derive`,
   `ControlStore.byKeyPrefix`); the reclaim tombstone re-scan (race 8) is designed for it.
+- **Manual retry** — `retry(key, expectedEpoch, Manual)` (new epoch, NEW handle) is specified
+  above but not yet implemented on any surface; it lands with the `Site.attach` / reconstitution
+  phase, which needs the same epoch-fenced control-store machinery (P6f.24/25).
 - **Multi-slot pilots** — v2: heartbeat `claimed` becomes a list; nothing else changes.
