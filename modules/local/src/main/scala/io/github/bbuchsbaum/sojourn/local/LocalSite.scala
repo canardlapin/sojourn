@@ -38,7 +38,7 @@ final case class LocalSiteConfig(
   * failure for diagnostics. Acquisition-time refusal is a `Resource` construction error, not a
   * routine task outcome — tasks themselves never raise.
   */
-final case class LocalSiteUnavailable(failure: PreflightFailure)
+final class LocalSiteUnavailable(val failure: PreflightFailure)
     extends RuntimeException(failure.toString)
 
 /** The scheduler-free [[Site]]: batch tasks execute on supervised fibers of this process, but
@@ -56,6 +56,7 @@ object LocalSite:
   ): Resource[F, Site[F]] =
     for
       supervisor <- Supervisor[F]
+      closed <- Resource.make(Ref.of[F, Boolean](false))(_.set(true))
       site <- Resource.eval {
         for
           preflight <- SitePreflight.verify[F](config.root)
@@ -65,7 +66,7 @@ object LocalSite:
           store <- FsSiteStore
             .open[F](config.name, config.root.resolve("store"), config.maximumObjectBytes)
           tasks <- Ref.of[F, Map[SubmissionKey, LocalTask[F]]](Map.empty)
-        yield new LocalSiteImpl[F](config.name, registry, store, tasks, supervisor)
+        yield new LocalSiteImpl[F](config.name, registry, store, tasks, supervisor, closed)
       }
     yield site
 
@@ -83,7 +84,8 @@ object LocalSite:
       registry: OperationRegistry[F],
       fsStore: FsSiteStore[F],
       tasks: Ref[F, Map[SubmissionKey, LocalTask[F]]],
-      supervisor: Supervisor[F]
+      supervisor: Supervisor[F],
+      closed: Ref[F, Boolean]
   ) extends Site[F]:
 
     val operations: OperationCatalog = registry.catalog
@@ -114,7 +116,7 @@ object LocalSite:
                   Left(
                     SubmitRejection.InvalidInput(
                       io.github.bbuchsbaum.scalaslurm.core
-                        .ValidationFailure("input", failure.toString)
+                        .ValidationFailure("input", describeRunFailure(failure))
                     )
                   )
                 )
@@ -149,18 +151,22 @@ object LocalSite:
         case PreparedInput.Carried(_, digest)    => digest
         case PreparedInput.Referenced(_, digest) => digest
       for
+        isClosed <- closed.get
         phase <- Ref.of[F, TaskPhase](TaskPhase.Queued)
         outcome <- Deferred[F, TaskOutcome[Nothing]]
         cancelRequested <- Deferred[F, Unit]
         candidate = LocalTask(op.descriptor, identity, phase, outcome, cancelRequested)
-        decision <- tasks.modify { current =>
-          current.get(key) match
-            case Some(existing)
-                if existing.descriptor == op.descriptor && existing.inputIdentity == identity =>
-              (current, Right(existing))
-            case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
-            case None    => (current.updated(key, candidate), Right(candidate))
-        }
+        decision <-
+          if isClosed then Async[F].pure(Left(SubmitRejection.Closed))
+          else
+            tasks.modify { current =>
+              current.get(key) match
+                case Some(existing)
+                    if existing.descriptor == op.descriptor && existing.inputIdentity == identity =>
+                  (current, Right(existing))
+                case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
+                case None    => (current.updated(key, candidate), Right(candidate))
+            }
         handle <- decision match
           case Left(rejection) => Async[F].pure(Left(rejection))
           case Right(task)     =>
@@ -188,7 +194,9 @@ object LocalSite:
               Async[F].pure(
                 TaskOutcome.Failed(
                   FailureDiagnosis(
-                    FailureCause.RequestPreparationFailed(Vector("stored-input-unavailable")),
+                    FailureCause.RequestPreparationFailed(
+                      "stored-input-unavailable" +: storeFailureCodes(storeFailure)
+                    ),
                     Vector.empty,
                     Vector.empty
                   )
@@ -247,10 +255,15 @@ object LocalSite:
           fsStore.putBytes(resultBytes, schema).map {
             case Right(ref) =>
               TaskOutcome.Succeeded(RemoteRef[Nothing](ref.site, ref.path, ref.digest, ref.schema))
-            case Left(_) =>
+            case Left(storeFailure) =>
+              // The result was produced; persisting it failed. That is a runtime fault of the
+              // site, not an invalid result — label it honestly and keep the evidence.
               TaskOutcome.Failed(
                 FailureDiagnosis(
-                  FailureCause.ResultInvalid(Vector("result-store-write-failed")),
+                  FailureCause.RuntimeError(
+                    ("result-store-write-failed" +: storeFailureCodes(storeFailure))
+                      .mkString(";")
+                  ),
                   Vector.empty,
                   Vector.empty
                 )
@@ -268,8 +281,14 @@ object LocalSite:
             )
           )
         case OperationRunFailure.Execution(code, message) =>
+          // The operation ran and failed: ProgramFailed carries both the stable code and the
+          // observed message, so no evidence is dropped on the floor.
           TaskOutcome.Failed(
-            FailureDiagnosis(FailureCause.WorkerFailure(code), Vector.empty, Vector.empty)
+            FailureDiagnosis(
+              FailureCause.ProgramFailed(None, Vector(code, message)),
+              Vector.empty,
+              Vector.empty
+            )
           )
         case OperationRunFailure.InvalidResult(detail) =>
           TaskOutcome.Failed(
@@ -279,6 +298,27 @@ object LocalSite:
               Vector.empty
             )
           )
+
+    /** Total, exhaustive projection of a [[StoreFailure]] into diagnostic codes — the sealed
+      * evidence travels; it is never flattened to a fixed string.
+      */
+    private def storeFailureCodes(failure: StoreFailure): Vector[String] =
+      failure match
+        case StoreFailure.NotFound(path) => Vector("not-found", path.value)
+        case StoreFailure.DigestMismatch(path, expected, observed) =>
+          Vector("digest-mismatch", path.value, expected.value, observed.value)
+        case StoreFailure.Decode(codecFailure) =>
+          Vector("decode", codecFailure.code, codecFailure.message)
+        case StoreFailure.Io(diagnostics) =>
+          diagnostics.values.toVector.flatMap(diagnostic =>
+            Vector(diagnostic.code, diagnostic.message)
+          )
+
+    private def describeRunFailure(failure: OperationRunFailure): String =
+      failure match
+        case OperationRunFailure.InvalidInput(detail)     => detail
+        case OperationRunFailure.Execution(code, message) => s"$code: $message"
+        case OperationRunFailure.InvalidResult(detail)    => detail
 
     private def taskHandle[O](submissionKey: SubmissionKey, task: LocalTask[F]): TaskHandle[F, O] =
       new TaskHandle[F, O]:

@@ -1,6 +1,6 @@
 import Dependencies.*
 
-ThisBuild / tlBaseVersion := "0.1"
+ThisBuild / tlBaseVersion := "0.2"
 ThisBuild / organization := "io.github.bbuchsbaum"
 ThisBuild / organizationName := "Bradley Buchsbaum"
 ThisBuild / startYear := Some(2026)
@@ -90,7 +90,8 @@ lazy val tck = project
       Libraries.catsEffect,
       Libraries.munit,
       Libraries.munitCatsEffect,
-      Libraries.scalaCheck
+      Libraries.scalaCheck,
+      Libraries.munitScalaCheck % Test
     )
   )
 

@@ -94,6 +94,12 @@ enum StoreFailure derives CanEqual:
   case Decode(failure: ResultCodecFailure)
   case Io(diagnostics: Diagnostics)
 
+/** Carries a typed [[StoreFailure]] across a stream boundary, where no `Either` channel exists.
+  * Part of the SPI's error contract: every backend's [[SiteStore.fetchStream]] fails with this
+  * carrier (verified by the conformance kit), so callers match on one type across backends.
+  */
+final class StoreStreamFailure(val failure: StoreFailure) extends RuntimeException(failure.toString)
+
 /** The content-addressed data plane for a site.
   *
   * The store is the reference-passing channel between clients and pilots: clients stage inputs with

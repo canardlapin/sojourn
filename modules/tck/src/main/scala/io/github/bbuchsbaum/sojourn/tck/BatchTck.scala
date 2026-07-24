@@ -32,6 +32,17 @@ abstract class BatchTck extends CatsEffectSuite:
       .toOption
       .get
 
+  test("law B0: the catalog names exactly what the site executes") {
+    val h = siteFixture()
+    val catalog = h.site.operations
+    for op <- List(h.echo, h.failing, h.sleepy, h.counting)
+    do assert(catalog.contains(op.descriptor), s"catalog is missing ${op.id.value}")
+    assert(
+      !catalog.contains(TckHarness.unregistered.descriptor),
+      "catalog claims an operation the harness never registered"
+    )
+  }
+
   test("law B1: an uncataloged operation is refused as UnknownOperation") {
     val h = siteFixture()
     h.site.batch
@@ -133,4 +144,20 @@ abstract class BatchTck extends CatsEffectSuite:
     yield outcome match
       case TaskOutcome.Interrupted(_) => ()
       case other                      => fail(s"expected Interrupted, observed $other")
+  }
+
+  test("law B8: submitting to a released site is refused as Closed, never an exception") {
+    // Deliberately leaks the Site value past its Resource scope: the law is precisely about
+    // what a stale reference observes after release.
+    harness
+      .use(h => IO.pure(h))
+      .flatMap { released =>
+        released.site.batch
+          .submit(released.echo, TaskInput.Inline("late"), freshKey("b8"))
+          .attempt
+      }
+      .map {
+        case Right(Left(SubmitRejection.Closed)) => ()
+        case other => fail(s"expected Left(Closed) from a released site, observed $other")
+      }
   }

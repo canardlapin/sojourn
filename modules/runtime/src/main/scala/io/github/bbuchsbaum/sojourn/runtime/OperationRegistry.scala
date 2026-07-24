@@ -83,9 +83,19 @@ object OperationRegistry:
           RegisteredOperation[F]
         ]]
       ) { (accumulated, entry) =>
-        accumulated.map { handlers =>
+        accumulated.flatMap { handlers =>
           val descriptor = entry.operation.descriptor
-          handlers.updated((descriptor.id, descriptor.version), lower(descriptor, entry))
+          val key = (descriptor.id, descriptor.version)
+          // The catalog dedups identical descriptors, but two entries with the same identity
+          // and different runners would be order-dependent behavior — refuse outright.
+          if handlers.contains(key) then
+            Left(
+              ValidationFailure(
+                "operationRegistry",
+                s"operation '${descriptor.id.value}' version '${descriptor.version.value}' is registered twice"
+              )
+            )
+          else Right(handlers.updated(key, lower(descriptor, entry)))
         }
       }
     yield new OperationRegistry(catalog, handlers)
@@ -100,7 +110,9 @@ object OperationRegistry:
       run = inputBytes =>
         entry.input.decode(inputBytes) match
           case Left(failure) =>
-            Sync[F].pure(Left(OperationRunFailure.InvalidInput(failure.toString)))
+            Sync[F].pure(
+              Left(OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}"))
+            )
           case Right(input) =>
             entry.run(input).attempt.map {
               case Left(error) =>
@@ -113,7 +125,9 @@ object OperationRegistry:
               case Right(value) =>
                 entry.result.encode(value) match
                   case Left(failure) =>
-                    Left(OperationRunFailure.InvalidResult(failure.toString))
+                    Left(
+                      OperationRunFailure.InvalidResult(s"${failure.code}: ${failure.message}")
+                    )
                   case Right(bytes) => Right(bytes)
             },
       encodeInput = value =>
@@ -121,5 +135,5 @@ object OperationRegistry:
         entry.input
           .encode(value.asInstanceOf[I])
           .left
-          .map(failure => OperationRunFailure.InvalidInput(failure.toString))
+          .map(failure => OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}"))
     )

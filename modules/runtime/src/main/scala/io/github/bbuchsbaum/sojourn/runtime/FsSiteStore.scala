@@ -16,6 +16,7 @@ import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.SiteStore
 import io.github.bbuchsbaum.sojourn.StoreFailure
+import io.github.bbuchsbaum.sojourn.StoreStreamFailure
 
 import java.nio.file.Files as JFiles
 import java.nio.file.LinkOption
@@ -24,12 +25,6 @@ import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 import java.util.UUID
 import scala.util.control.NonFatal
-
-/** Carries a typed [[StoreFailure]] across a stream boundary, where no `Either` channel exists.
-  * [[FsSiteStore.fetchStream]] raises it before the first byte of a corrupt object is emitted.
-  */
-final case class StoreStreamFailure(failure: StoreFailure)
-    extends RuntimeException(failure.toString)
 
 /** A content-addressed [[SiteStore]] on a locally mounted (possibly shared) POSIX filesystem.
   *
@@ -76,36 +71,50 @@ final class FsSiteStore[F[_]: Async] private (
       schema: SchemaId
   ): F[Either[StoreFailure, RemoteRef[Vector[Byte]]]] =
     val temporary = root.resolve(s".stage-${UUID.randomUUID()}")
-    val staged =
-      for
-        _ <- Async[F].blocking {
-          JFiles.createDirectories(root)
-          val _ = JFiles.createFile(temporary)
+    val acquire = Async[F].blocking {
+      JFiles.createDirectories(root)
+      val _ = JFiles.createFile(temporary)
+      MessageDigest.getInstance("SHA-256")
+    }
+    // The bound is enforced as bytes arrive, the staged file is fsynced before it is claimed
+    // to its content address, and the temporary is removed on success, failure, AND
+    // cancellation — the staging lifecycle is bracketed, not best-effort.
+    def stage(digestOut: MessageDigest): F[Either[StoreFailure, RemoteRef[Vector[Byte]]]] =
+      bytes.chunks
+        .evalScan(Right(0L): Either[StoreFailure, Long]) {
+          case (Left(failure), _)    => Async[F].pure(Left(failure))
+          case (Right(count), chunk) =>
+            val next = count + chunk.size.toLong
+            if next > maximumObjectBytes.value.toLong then Async[F].pure(Left(tooLarge(next)))
+            else
+              Async[F].blocking {
+                digestOut.update(chunk.toArray)
+                val _ = JFiles.write(temporary, chunk.toArray, StandardOpenOption.APPEND)
+                Right(next)
+              }
         }
-        digestOut <- Async[F].delay(MessageDigest.getInstance("SHA-256"))
-        count <- bytes.chunks
-          .evalMap { chunk =>
+        .takeThrough(_.isRight)
+        .compile
+        .lastOrError
+        .flatMap {
+          case Left(failure) => Async[F].pure(Left(failure))
+          case Right(_)      =>
             Async[F].blocking {
-              digestOut.update(chunk.toArray)
-              JFiles.write(temporary, chunk.toArray, StandardOpenOption.APPEND)
-              chunk.size.toLong
+              forceBlocking(temporary)
+              val hex = digestOut.digest().map(byte => f"${byte & 0xff}%02x").mkString
+              finalizeStagedBlocking(temporary, hex, schema)
             }
-          }
-          .fold(0L)(_ + _)
-          .compile
-          .lastOrError
-        outcome <- Async[F].blocking {
-          if count > maximumObjectBytes.value.toLong then
-            Left(tooLarge(count)): Either[StoreFailure, RemoteRef[Vector[Byte]]]
-          else
-            val hex = digestOut.digest().map(byte => f"${byte & 0xff}%02x").mkString
-            finalizeStagedBlocking(temporary, hex, schema)
         }
-      yield outcome
-    staged
-      .handleError(error => Left(io(error)))
-      .flatTap(_ => Async[F].blocking { val _ = JFiles.deleteIfExists(temporary) })
+        .handleError(error => Left(inputStreamFailed(error)))
 
+    Async[F].bracket(acquire)(stage)(_ =>
+      Async[F].blocking { val _ = JFiles.deleteIfExists(temporary) }
+    )
+
+  /** Streams the verified object. v0 buffers the whole object in memory (bounded by
+    * `maximumObjectBytes`) so the digest is provably checked before the first emitted byte; chunked
+    * verified streaming is a later refinement, not an assumption callers may make.
+    */
   def fetchStream[A](ref: RemoteRef[A]): Stream[F, Byte] =
     Stream
       .eval(Async[F].blocking(readVerifiedBlocking(ref.path, Some(ref.digest))))
@@ -160,11 +169,12 @@ final class FsSiteStore[F[_]: Async] private (
       hex: String,
       schema: SchemaId
   ): Either[StoreFailure, RemoteRef[Vector[Byte]]] =
-    objectPath(hex).flatMap { path =>
-      val target = resolveUnder(path)
-      JFiles.createDirectories(target.getParent)
-      val digest = digestFromHex(hex)
-      AtomicFiles.claimBlocking(temporary, target) match
+    for
+      path <- objectPath(hex)
+      digest <- digestFromHex(hex)
+      target = resolveUnder(path)
+      _ = JFiles.createDirectories(target.getParent)
+      ref <- AtomicFiles.claimBlocking(temporary, target) match
         case Right(_) =>
           Right(RemoteRef[Vector[Byte]](site, path, digest, schema))
         case Left(AtomicFiles.ClaimFailure.AlreadyClaimed(_)) =>
@@ -172,8 +182,18 @@ final class FsSiteStore[F[_]: Async] private (
           Right(RemoteRef[Vector[Byte]](site, path, digest, schema))
         case Left(AtomicFiles.ClaimFailure.AtomicMoveUnavailable(_)) =>
           Left(ioDetail("store filesystem does not support atomic rename"))
-        case Left(other) => Left(ioDetail(other.toString))
-    }
+        case Left(AtomicFiles.ClaimFailure.SourceMissing(from)) =>
+          Left(ioDetail(s"staged object disappeared before it could be claimed: $from"))
+        case Left(AtomicFiles.ClaimFailure.SourceNotRegular(from)) =>
+          Left(ioDetail(s"staged object is not a regular file: $from"))
+        case Left(AtomicFiles.ClaimFailure.Io(detail)) =>
+          Left(ioDetail(detail))
+    yield ref
+
+  private def forceBlocking(path: Path): Unit =
+    val channel = java.nio.channels.FileChannel.open(path, StandardOpenOption.WRITE)
+    try channel.force(true)
+    finally channel.close()
 
   private def readVerifiedBlocking(
       path: SitePath,
@@ -205,10 +225,11 @@ final class FsSiteStore[F[_]: Async] private (
     // SitePath is parsed: relative, no traversal segments — resolution cannot escape the root.
     root.resolve(path.value)
 
-  private def digestFromHex(hex: String): ContentDigest =
+  private def digestFromHex(hex: String): Either[StoreFailure, ContentDigest] =
     ContentDigest
       .from(s"sha256:$hex")
-      .fold(problem => throw new IllegalStateException(problem.reason), identity)
+      .left
+      .map(problem => ioDetail(s"invalid digest for staged object: ${problem.reason}"))
 
   private def tooLarge(size: Long): StoreFailure =
     ioDetail(s"object of $size bytes exceeds the ${maximumObjectBytes.value}-byte store bound")
@@ -218,6 +239,16 @@ final class FsSiteStore[F[_]: Async] private (
 
   private def io(error: Throwable): StoreFailure =
     ioDetail(Option(error.getMessage).getOrElse(error.getClass.getSimpleName))
+
+  private def inputStreamFailed(error: Throwable): StoreFailure =
+    StoreFailure.Io(
+      Diagnostics.one(
+        Diagnostic(
+          "store-input-stream-failed",
+          Option(error.getMessage).getOrElse(error.getClass.getSimpleName)
+        )
+      )
+    )
 
 object FsSiteStore:
   def open[F[_]: Async](

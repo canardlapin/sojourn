@@ -24,13 +24,11 @@ enum PreflightFailure derives CanEqual:
   /** An unclassified fault while probing, with the observed detail. */
   case Io(detail: String)
 
-/** Evidence that a root passed the preflight probes, for diagnostics and acceptance records. */
-final case class SharedFsEvidence(
-    root: String,
-    atomicRenameProbed: Boolean,
-    exclusiveCreateProbed: Boolean,
-    fsyncProbed: Boolean
-) derives CanEqual
+/** Evidence that a root passed every preflight probe (atomic rename, CREATE_NEW exclusivity,
+  * fsync-forced write). A value of this type exists only when all probes succeeded — partial
+  * evidence is not a state, which is why this is a bare record rather than a checklist.
+  */
+final case class SharedFsEvidence(root: String) derives CanEqual
 
 /** Probes a filesystem root for the properties the store and spool protocols assume.
   *
@@ -86,12 +84,7 @@ object SitePreflight:
           _ <- firstWrite
           _ <- exclusivity
           _ <- claimProbe
-        yield SharedFsEvidence(
-          root.toString,
-          atomicRenameProbed = true,
-          exclusiveCreateProbed = true,
-          fsyncProbed = true
-        )
+        yield SharedFsEvidence(root.toString)
       catch case NonFatal(error) => Left(PreflightFailure.Io(describe(error)))
 
     try

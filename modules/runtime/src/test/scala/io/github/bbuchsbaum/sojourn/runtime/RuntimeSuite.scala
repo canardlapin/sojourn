@@ -41,11 +41,8 @@ class SitePreflightSuite extends munit.CatsEffectSuite:
       SitePreflight
         .verify[IO](root)
         .map {
-          case Right(evidence) =>
-            assert(evidence.atomicRenameProbed)
-            assert(evidence.exclusiveCreateProbed)
-            assert(evidence.fsyncProbed)
-          case Left(failure) => fail(s"expected evidence, observed $failure")
+          case Right(evidence) => assertEquals(evidence.root, root.toString)
+          case Left(failure)   => fail(s"expected evidence, observed $failure")
         }
         .guarantee(IO.blocking {
           val _ = Files
