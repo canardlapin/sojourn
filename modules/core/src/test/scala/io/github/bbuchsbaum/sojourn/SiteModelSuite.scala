@@ -10,11 +10,13 @@ class SiteModelSuite extends munit.ScalaCheckSuite:
   private val tokenChar: Gen[Char] =
     Gen.oneOf(('a' to 'z') ++ ('0' to '9') ++ Seq('-', '_', '.'))
 
+  // The reserved path atoms "." and ".." are valid token *strings* but rejected token *values*
+  // (covered by a dedicated test below); the round-trip generator must not produce them.
   private val siteNameText: Gen[String] =
-    for
+    (for
       n <- Gen.choose(1, 40)
       chars <- Gen.listOfN(n, tokenChar)
-    yield chars.mkString
+    yield chars.mkString).suchThat(raw => raw != "." && raw != "..")
 
   // Segments start with a letter, so they are never empty, ".", or "..".
   private val segment: Gen[String] =

@@ -21,6 +21,7 @@ object Dependencies {
       "io.github.bbuchsbaum" %% "scala-slurm-managed" % Versions.scalaSlurm
     val scalaSlurmLocal = "io.github.bbuchsbaum" %% "scala-slurm-local" % Versions.scalaSlurm
     val catsEffect = "org.typelevel" %% "cats-effect" % Versions.catsEffect
+    val catsEffectTestkit = "org.typelevel" %% "cats-effect-testkit" % Versions.catsEffect
     val fs2Core = "co.fs2" %% "fs2-core" % Versions.fs2
     val fs2Io = "co.fs2" %% "fs2-io" % Versions.fs2
     val circeCore = "io.circe" %% "circe-core" % Versions.circe

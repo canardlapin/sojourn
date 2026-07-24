@@ -3,10 +3,15 @@ package io.github.bbuchsbaum.sojourn.demo
 import cats.effect.IO
 import cats.effect.Resource
 import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
+import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
+import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
 import io.github.bbuchsbaum.scalaslurm.core.ResourceRequest
+import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
 import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
 import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
+import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.SiteName
+import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.slurm.SlurmSite
 import io.github.bbuchsbaum.sojourn.slurm.SlurmSiteConfig
 import io.github.bbuchsbaum.sojourn.tck.BatchTck
@@ -79,8 +84,26 @@ object SlurmTckEnvironment:
             Files.write(target, "corrupted-by-tck".getBytes(StandardCharsets.UTF_8))
             true
           else false
-        }
+        },
+      poolSpec = defaultPoolSpec
     )
+
+  /** The pool laws are not yet instantiated for Slurm (its pool arrives in a later phase); this
+    * spec exists so the harness record is total.
+    */
+  private def defaultPoolSpec: PoolSpec =
+    PoolSpec
+      .from(
+        pilots = PositiveInt.from("pilots", 2).toOption.get,
+        minReady = PositiveInt.from("minReady", 1).toOption.get,
+        walltime = WallTimeMinutes.from(10L).toOption.get,
+        drainGrace = DurationMillis.from(15_000L).toOption.get,
+        heartbeatEvery = DurationMillis.from(5_000L).toOption.get,
+        readyTimeout = DurationMillis.from(120_000L).toOption.get,
+        spoolRoot = SitePath.from("spool").toOption.get
+      )
+      .toOption
+      .get
 
   private def defaultResources: ResourceRequest =
     ResourceRequest

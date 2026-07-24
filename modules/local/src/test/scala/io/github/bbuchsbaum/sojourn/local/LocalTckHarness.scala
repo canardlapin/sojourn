@@ -4,11 +4,16 @@ import cats.effect.IO
 import cats.effect.Resource
 import cats.effect.kernel.Ref
 import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
+import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
 import io.github.bbuchsbaum.scalaslurm.core.OperationId
 import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
+import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
 import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
+import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
+import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SiteOperation
+import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
 import io.github.bbuchsbaum.sojourn.tck.TckHarness
 import io.github.bbuchsbaum.sojourn.tck.TckWire
@@ -34,6 +39,23 @@ object LocalTckHarness:
   val failing: SiteOperation[String, String] = operation("failing")
   val sleepy: SiteOperation[String, String] = operation("sleepy")
   val counting: SiteOperation[String, String] = operation("counting")
+
+  /** Harness-appropriate small pool: two pilots, floor of one, short heartbeat, generous
+    * ready-timeout — fast laws over the real lease machinery.
+    */
+  val poolSpec: PoolSpec =
+    PoolSpec
+      .from(
+        pilots = PositiveInt.from("pilots", 2).toOption.get,
+        minReady = PositiveInt.from("minReady", 1).toOption.get,
+        walltime = WallTimeMinutes.from(5L).toOption.get,
+        drainGrace = DurationMillis.from(1000L).toOption.get,
+        heartbeatEvery = DurationMillis.from(200L).toOption.get,
+        readyTimeout = DurationMillis.from(60_000L).toOption.get,
+        spoolRoot = SitePath.from("spool").toOption.get
+      )
+      .toOption
+      .get
 
   private val temporaryRoot: Resource[IO, Path] =
     Resource.make(IO.blocking(Files.createTempDirectory("local-tck")))(root =>
@@ -86,7 +108,7 @@ object LocalTckHarness:
             .map(failure => new IllegalStateException(failure.reason))
         )
       )
-      site <- LocalSite.open[IO](
+      site <- LocalSite.open(
         LocalSiteConfig(
           SiteName.from("local-tck").toOption.get,
           root,
@@ -108,5 +130,6 @@ object LocalTckHarness:
             Files.write(target, "corrupted-by-tck".getBytes("UTF-8"))
             true
           else false
-        }
+        },
+      poolSpec = poolSpec
     )

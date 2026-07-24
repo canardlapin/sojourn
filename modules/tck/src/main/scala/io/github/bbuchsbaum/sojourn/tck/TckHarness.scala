@@ -3,6 +3,7 @@ package io.github.bbuchsbaum.sojourn.tck
 import cats.effect.IO
 import io.github.bbuchsbaum.scalaslurm.core.OperationId
 import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
+import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.RemoteRef
 import io.github.bbuchsbaum.sojourn.Site
 import io.github.bbuchsbaum.sojourn.SiteOperation
@@ -19,6 +20,10 @@ import io.github.bbuchsbaum.sojourn.SiteOperation
   * `corrupt` flips bytes of the stored object behind a reference so digest verification can be
   * proven; a backend whose store cannot be corrupted out-of-band returns `false` and the corruption
   * law is skipped (reported, not silently passed).
+  *
+  * `poolSpec` is the specification the pool laws acquire pools with — harness-appropriate small
+  * values (few pilots, a short heartbeat) so the laws run in seconds while still exercising the
+  * real lease machinery.
   */
 final case class TckHarness(
     site: Site[IO],
@@ -27,7 +32,8 @@ final case class TckHarness(
     sleepy: SiteOperation[String, String],
     counting: SiteOperation[String, String],
     executions: IO[Long],
-    corrupt: RemoteRef[?] => IO[Boolean]
+    corrupt: RemoteRef[?] => IO[Boolean],
+    poolSpec: PoolSpec
 )
 
 object TckHarness:

@@ -58,6 +58,7 @@ lazy val runtime = project
       Libraries.catsEffect,
       Libraries.fs2Core,
       Libraries.fs2Io,
+      Libraries.catsEffectTestkit % Test,
       Libraries.munit % Test,
       Libraries.munitCatsEffect % Test,
       Libraries.munitScalaCheck % Test,

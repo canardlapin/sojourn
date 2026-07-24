@@ -1,8 +1,8 @@
 package io.github.bbuchsbaum.sojourn.local
 
-import cats.effect.kernel.Async
-import cats.effect.kernel.Clock
+import cats.effect.IO
 import cats.effect.kernel.Deferred
+import cats.effect.kernel.Outcome
 import cats.effect.kernel.Ref
 import cats.effect.kernel.Resource
 import cats.effect.std.Supervisor
@@ -16,6 +16,9 @@ import io.github.bbuchsbaum.scalaslurm.core.FailureDiagnosis
 import io.github.bbuchsbaum.scalaslurm.core.Freshness
 import io.github.bbuchsbaum.scalaslurm.core.SchemaId
 import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
+import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
+import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
+import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
 import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
@@ -24,8 +27,26 @@ import io.github.bbuchsbaum.sojourn.runtime.OperationRunFailure
 import io.github.bbuchsbaum.sojourn.runtime.PreflightFailure
 import io.github.bbuchsbaum.sojourn.runtime.RegisteredOperation
 import io.github.bbuchsbaum.sojourn.runtime.SitePreflight
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotFatal
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLiveness
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoop
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoopConfig
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotObserver
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotReport
+import io.github.bbuchsbaum.sojourn.runtime.spool.PilotStopCause
+import io.github.bbuchsbaum.sojourn.runtime.spool.PoolDispatcher
+import io.github.bbuchsbaum.sojourn.runtime.spool.PoolDispatcherConfig
+import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolFiles
+import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolIntegrityFailure
+import io.github.bbuchsbaum.sojourn.runtime.spool.SpoolPaths
+import io.github.bbuchsbaum.sojourn.spool.PilotId
+import io.github.bbuchsbaum.sojourn.spool.PoolManifest
+import io.github.bbuchsbaum.sojourn.spool.SpoolLimits
 
 import java.nio.file.Path
+import java.time.Instant
+import java.util.UUID
+import scala.concurrent.duration.*
 
 /** Configuration for a scheduler-free local site. */
 final case class LocalSiteConfig(
@@ -41,82 +62,257 @@ final case class LocalSiteConfig(
 final class LocalSiteUnavailable(val failure: PreflightFailure)
     extends RuntimeException(failure.toString)
 
+/** Raised only at pool acquisition when the spool cannot be constructed (layout, manifest, or
+  * identity failures). Routine task and lease outcomes are never raised.
+  */
+final class LocalPoolUnavailable(detail: String) extends RuntimeException(detail)
+
 /** The scheduler-free [[Site]]: batch tasks execute on supervised fibers of this process, but
   * through the same store-mediated result path as any remote backend — every success is a
-  * digest-verified [[RemoteRef]] in the site store, never an in-memory value. This is what makes
-  * local conformance meaningful and keeps outcome semantics identical across backends.
+  * digest-verified [[RemoteRef]] in the site store, never an in-memory value. The pool runs real
+  * [[PilotLoop]]s over a real filesystem spool (real rename races), dispatched by the shared
+  * [[PoolDispatcher]].
   *
-  * The pool surface arrives with the spool runtime (phase 5); until then [[Site.pool]] fails
-  * acquisition with an [[UnsupportedOperationException]].
+  * IO-shaped by commitment, not accident: the pilot runtime is the same code that runs inside the
+  * worker binary (IO-hardcoded upstream), and this module commits to that rather than pretending a
+  * polymorphism it cannot honor (the same recorded wart as the Slurm backend).
   */
 object LocalSite:
-  def open[F[_]: Async](
+  def open(
       config: LocalSiteConfig,
-      registry: OperationRegistry[F]
-  ): Resource[F, Site[F]] =
+      registry: OperationRegistry[IO]
+  ): Resource[IO, Site[IO]] =
     for
-      supervisor <- Supervisor[F]
-      closed <- Resource.make(Ref.of[F, Boolean](false))(_.set(true))
+      supervisor <- Supervisor[IO]
+      closed <- Resource.make(Ref.of[IO, Boolean](false))(_.set(true))
       site <- Resource.eval {
         for
-          preflight <- SitePreflight.verify[F](config.root)
+          preflight <- SitePreflight.verify[IO](config.root)
           _ <- preflight match
-            case Left(failure) => Async[F].raiseError(LocalSiteUnavailable(failure))
-            case Right(_)      => Async[F].unit
+            case Left(failure) => IO.raiseError(LocalSiteUnavailable(failure))
+            case Right(_)      => IO.unit
           store <- FsSiteStore
-            .open[F](config.name, config.root.resolve("store"), config.maximumObjectBytes)
-          tasks <- Ref.of[F, Map[SubmissionKey, LocalTask[F]]](Map.empty)
-        yield new LocalSiteImpl[F](config.name, registry, store, tasks, supervisor, closed)
+            .open[IO](config.name, config.root.resolve("store"), config.maximumObjectBytes)
+          tasks <- Ref.of[IO, Map[SubmissionKey, LocalTask]](Map.empty)
+        yield new LocalSiteImpl(config, registry, store, tasks, supervisor, closed)
       }
     yield site
 
   /** One accepted submission: its request identity for conflict detection plus its live state. */
-  final private case class LocalTask[F[_]](
+  final private case class LocalTask(
       descriptor: OperationDescriptor,
       inputIdentity: ContentDigest,
-      phase: Ref[F, TaskPhase],
-      outcome: Deferred[F, TaskOutcome[Nothing]],
-      cancelRequested: Deferred[F, Unit]
+      phase: Ref[IO, TaskPhase],
+      outcome: Deferred[IO, TaskOutcome[Nothing]],
+      cancelRequested: Deferred[IO, Unit]
   )
 
-  final private class LocalSiteImpl[F[_]: Async](
-      val name: SiteName,
-      registry: OperationRegistry[F],
-      fsStore: FsSiteStore[F],
-      tasks: Ref[F, Map[SubmissionKey, LocalTask[F]]],
-      supervisor: Supervisor[F],
-      closed: Ref[F, Boolean]
-  ) extends Site[F]:
+  final private class LocalSiteImpl(
+      config: LocalSiteConfig,
+      registry: OperationRegistry[IO],
+      fsStore: FsSiteStore[IO],
+      tasks: Ref[IO, Map[SubmissionKey, LocalTask]],
+      supervisor: Supervisor[IO],
+      closed: Ref[IO, Boolean]
+  ) extends Site[IO]:
+
+    val name: SiteName = config.name
 
     val operations: OperationCatalog = registry.catalog
 
-    def store: SiteStore[F] = fsStore
+    def store: SiteStore[IO] = fsStore
 
-    def pool(spec: PoolSpec): Resource[F, LeasedPool[F]] =
-      Resource.eval(
-        Async[F].raiseError(
-          new UnsupportedOperationException(
-            "the local pool arrives with the spool runtime (phase 5)"
+    // ─── pool ────────────────────────────────────────────────────────────────
+
+    /** Acquire a leased pool: a fresh spool root per acquisition (a drained pool never un-drains,
+      * so a new pool always gets a new root), a published manifest, `spec.pilots` in-process
+      * [[PilotLoop]] fibers, and a [[PoolDispatcher]] wired to a fiber-backed [[PilotObserver]].
+      *
+      * Release ordering: the dispatcher's finalizer runs first (drain marker → bounded quiesce →
+      * settle → backend cancellation → `Revoked(Cancelled)`), where "backend cancellation" is the
+      * cancellation of the pilot fibers; the outer per-fiber finalizers then reap any stragglers.
+      */
+    def pool(spec: PoolSpec): Resource[IO, LeasedPool[IO]] =
+      for
+        _ <- Resource.eval(
+          closed.get.flatMap(isClosed =>
+            IO.raiseWhen(isClosed)(new LocalPoolUnavailable("the site is released"))
           )
         )
+        acquiredAt <- Resource.eval(IO.realTimeInstant)
+        poolId <- Resource.eval(mintPoolId)
+        spoolRoot = config.root.resolve(spec.spoolRoot.value).resolve(poolId.value)
+        paths <- Resource.eval(orRaise(SpoolPaths.at(spoolRoot)))
+        spool = new SpoolFiles[IO](paths)
+        _ <- Resource.eval(spool.initialize.flatMap(orRaiseWrite))
+        limits <- Resource.eval(orRaise(spoolLimits))
+        manifest = PoolManifest(
+          poolId,
+          name,
+          spec.pilots,
+          spec.minReady,
+          spec.heartbeatEvery,
+          spec.drainGrace,
+          limits
+        )
+        _ <- Resource.eval(spool.publishManifest(manifest).flatMap(orRaiseWrite))
+        deadline = acquiredAt.plusSeconds(spec.walltime.toLong * 60L)
+        release <- Resource.eval(orRaise(localRelease))
+        pilotIds <- Resource.eval(orRaise(mintPilotIds(spec.pilots.toInt)))
+        terminals <- Resource.eval(Ref.of[IO, Map[PilotId, Diagnostic]](Map.empty))
+        fibers <- pilotIds.traverse(pilotId =>
+          Resource.make(
+            runPilot(pilotId, spoolRoot, release, deadline, terminals).start
+          )(_.cancel)
+        )
+        observer = new PilotObserver[IO]:
+          def observe(pilot: PilotId): IO[PilotLiveness] =
+            terminals.get.map(_.get(pilot) match
+              case Some(evidence) => PilotLiveness.Terminal(evidence)
+              case None           => PilotLiveness.Running)
+        cancelBackend = fibers.traverse_(_.cancel).as(Vector.empty[Diagnostic])
+        dispatcherConfig = PoolDispatcherConfig(
+          site = name,
+          spec = spec,
+          manifest = manifest,
+          pilots = pilotIds,
+          initialDeadline = deadline,
+          pollEvery = math.max(25L, math.min(1000L, spec.heartbeatEvery.value / 2L)).millis
+        )
+        pool <- PoolDispatcher.resource(
+          dispatcherConfig,
+          registry,
+          fsStore,
+          spool,
+          observer,
+          cancelBackend
+        )
+      yield pool
+
+    private def runPilot(
+        pilotId: PilotId,
+        spoolRoot: Path,
+        release: WorkerRelease,
+        deadline: Instant,
+        terminals: Ref[IO, Map[PilotId, Diagnostic]]
+    ): IO[Unit] =
+      PilotLoop
+        .run(PilotLoopConfig(spoolRoot, pilotId, release, deadline), registry, fsStore)
+        .guaranteeCase {
+          case Outcome.Succeeded(result) =>
+            result.flatMap {
+              case Left(fatal) =>
+                terminals.update(
+                  _.updated(pilotId, Diagnostic("pilot-fatal", describeFatal(fatal)))
+                )
+              case Right(report) =>
+                terminals.update(
+                  _.updated(pilotId, Diagnostic("pilot-exited", describeReport(report)))
+                )
+            }
+          case Outcome.Errored(error) =>
+            terminals.update(
+              _.updated(
+                pilotId,
+                Diagnostic(
+                  "pilot-crashed",
+                  Option(error.getMessage).getOrElse(error.getClass.getSimpleName)
+                )
+              )
+            )
+          case Outcome.Canceled() =>
+            terminals.update(
+              _.updated(pilotId, Diagnostic("pilot-cancelled", "the pilot fiber was cancelled"))
+            )
+        }
+        .void
+
+    private def mintPoolId: IO[PilotId] =
+      IO(UUID.randomUUID().toString.toLowerCase).flatMap(uuid =>
+        orRaise(PilotId.from(s"pool-$uuid"))
       )
 
-    val batch: TaskRunner[F] = new TaskRunner[F]:
+    private def mintPilotIds(count: Int): Either[ValidationFailure, Vector[PilotId]] =
+      (0 until count).toVector.traverse(index => PilotId.from(s"p$index"))
+
+    /** In-process pilots have no staged worker artifact; the release identity is a fixed local
+      * marker whose digest is the empty payload's digest — honest about there being nothing to
+      * verify, while keeping the registration and envelope schema total.
+      */
+    private def localRelease: Either[ValidationFailure, WorkerRelease] =
+      WorkerReleaseId
+        .from("local-in-process")
+        .map(id => WorkerRelease(id, AtomicFiles.digestOf(Vector.empty)))
+
+    private def spoolLimits: Either[ValidationFailure, SpoolLimits] =
+      ByteLimit
+        .from(
+          math.min(config.maximumObjectBytes.value, ByteLimit.maximumCommandCapture.value)
+        )
+        .map(inline =>
+          SpoolLimits(inline, config.maximumObjectBytes, ByteLimit.maximumCommandCapture)
+        )
+
+    private def orRaise[A](either: Either[ValidationFailure, A]): IO[A] =
+      IO.fromEither(
+        either.left.map(failure => new LocalPoolUnavailable(s"${failure.field}: ${failure.reason}"))
+      )
+
+    private def orRaiseWrite(either: Either[AtomicFiles.WriteFailure, Unit]): IO[Unit] =
+      IO.fromEither(
+        either.left.map(failure => new LocalPoolUnavailable(describeWriteFailure(failure)))
+      )
+
+    private def describeWriteFailure(failure: AtomicFiles.WriteFailure): String = failure match
+      case AtomicFiles.WriteFailure.TargetExists(path)           => s"target exists: $path"
+      case AtomicFiles.WriteFailure.TargetConflict(path, detail) => s"conflict at $path: $detail"
+      case AtomicFiles.WriteFailure.AtomicMoveUnavailable(path)  =>
+        s"atomic move unavailable: $path"
+      case AtomicFiles.WriteFailure.Io(detail) => detail
+
+    private def describeFatal(fatal: PilotFatal): String = fatal match
+      case PilotFatal.SpoolInvalid(detail)         => s"spool invalid: $detail"
+      case PilotFatal.ManifestUnavailable(failure) =>
+        s"manifest unavailable: ${describeIntegrity(failure)}"
+      case PilotFatal.AlreadyRegistered(pilot)    => s"pilot id ${pilot.value} already registered"
+      case PilotFatal.RegistrationFailed(detail)  => s"registration failed: $detail"
+      case PilotFatal.AtomicMoveUnavailable(path) => s"atomic move unavailable: $path"
+      case PilotFatal.ResultUnpublishable(detail) => s"result unpublishable: $detail"
+
+    private def describeIntegrity(failure: SpoolIntegrityFailure): String = failure match
+      case SpoolIntegrityFailure.Missing(path)                   => s"missing: $path"
+      case SpoolIntegrityFailure.Unreadable(path, detail)        => s"unreadable $path: $detail"
+      case SpoolIntegrityFailure.Undecodable(path, codecFailure) =>
+        s"undecodable $path: $codecFailure"
+      case SpoolIntegrityFailure.BindingMismatch(path, token, epoch, bodyKey, bodyEpoch) =>
+        s"binding mismatch at $path: filename ($token, e${epoch.value}) vs body " +
+          s"(key '${bodyKey.value}', e${bodyEpoch.value})"
+
+    private def describeReport(report: PilotReport): String =
+      val cause = report.stopCause match
+        case PilotStopCause.DrainMarkerObserved => "drain marker observed"
+        case PilotStopCause.DeadlineReached     => "deadline reached"
+      s"drained ($cause) after ${report.executed} executions" +
+        (if report.evidence.isEmpty then ""
+         else s"; ${report.evidence.size} retained diagnostics")
+
+    // ─── batch ───────────────────────────────────────────────────────────────
+
+    val batch: TaskRunner[IO] = new TaskRunner[IO]:
       def submit[I, O](
           op: SiteOperation[I, O],
           input: TaskInput[I],
           key: SubmissionKey
-      ): F[Either[SubmitRejection, TaskHandle[F, O]]] =
+      ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
         registry.lookup(op.descriptor) match
-          case None             => Async[F].pure(Left(SubmitRejection.UnknownOperation(op.id)))
+          case None             => IO.pure(Left(SubmitRejection.UnknownOperation(op.id)))
           case Some(registered) =>
             prepareInput(registered, input) match
               case Left(failure) =>
-                Async[F].pure(
+                IO.pure(
                   Left(
                     SubmitRejection.InvalidInput(
-                      io.github.bbuchsbaum.scalaslurm.core
-                        .ValidationFailure("input", describeRunFailure(failure))
+                      ValidationFailure("input", describeRunFailure(failure))
                     )
                   )
                 )
@@ -130,7 +326,7 @@ object LocalSite:
       case Referenced(path: SitePath, identity: ContentDigest)
 
     private def prepareInput[I](
-        registered: RegisteredOperation[F],
+        registered: RegisteredOperation[IO],
         input: TaskInput[I]
     ): Either[OperationRunFailure, PreparedInput] =
       input match
@@ -143,21 +339,21 @@ object LocalSite:
 
     private def admit[I, O](
         op: SiteOperation[I, O],
-        registered: RegisteredOperation[F],
+        registered: RegisteredOperation[IO],
         prepared: PreparedInput,
         key: SubmissionKey
-    ): F[Either[SubmitRejection, TaskHandle[F, O]]] =
+    ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
       val identity = prepared match
         case PreparedInput.Carried(_, digest)    => digest
         case PreparedInput.Referenced(_, digest) => digest
       for
         isClosed <- closed.get
-        phase <- Ref.of[F, TaskPhase](TaskPhase.Queued)
-        outcome <- Deferred[F, TaskOutcome[Nothing]]
-        cancelRequested <- Deferred[F, Unit]
+        phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
+        outcome <- Deferred[IO, TaskOutcome[Nothing]]
+        cancelRequested <- Deferred[IO, Unit]
         candidate = LocalTask(op.descriptor, identity, phase, outcome, cancelRequested)
         decision <-
-          if isClosed then Async[F].pure(Left(SubmitRejection.Closed))
+          if isClosed then IO.pure(Left(SubmitRejection.Closed))
           else
             tasks.modify { current =>
               current.get(key) match
@@ -168,30 +364,30 @@ object LocalSite:
                 case None    => (current.updated(key, candidate), Right(candidate))
             }
         handle <- decision match
-          case Left(rejection) => Async[F].pure(Left(rejection))
+          case Left(rejection) => IO.pure(Left(rejection))
           case Right(task)     =>
             val start =
               if task eq candidate then
                 supervisor.supervise(execute(registered, prepared, task)).void
-              else Async[F].unit
+              else IO.unit
             start.as(Right(taskHandle[O](key, task)))
       yield handle
 
     private def execute(
-        registered: RegisteredOperation[F],
+        registered: RegisteredOperation[IO],
         prepared: PreparedInput,
-        task: LocalTask[F]
-    ): F[Unit] =
-      val work: F[TaskOutcome[Nothing]] =
+        task: LocalTask
+    ): IO[Unit] =
+      val work: IO[TaskOutcome[Nothing]] =
         for
           _ <- task.phase.set(TaskPhase.Running)
           inputBytes <- prepared match
-            case PreparedInput.Carried(bytes, _)        => Async[F].pure(Right(bytes))
+            case PreparedInput.Carried(bytes, _)        => IO.pure(Right(bytes))
             case PreparedInput.Referenced(path, digest) =>
               fsStore.readBytes(path, Some(digest))
           outcome <- inputBytes match
             case Left(storeFailure) =>
-              Async[F].pure(
+              IO.pure(
                 TaskOutcome.Failed(
                   FailureDiagnosis(
                     FailureCause.RequestPreparationFailed(
@@ -204,12 +400,12 @@ object LocalSite:
               )
             case Right(bytes) =>
               registered.run(bytes).flatMap {
-                case Left(failure)      => Async[F].pure(failed(failure): TaskOutcome[Nothing])
+                case Left(failure)      => IO.pure(failed(failure): TaskOutcome[Nothing])
                 case Right(resultBytes) => publish(registered, resultBytes)
               }
         yield outcome
 
-      val interrupted: F[TaskOutcome[Nothing]] =
+      val interrupted: IO[TaskOutcome[Nothing]] =
         task.cancelRequested.get.as(
           TaskOutcome.Interrupted(
             Diagnostics.one(
@@ -218,8 +414,7 @@ object LocalSite:
           ): TaskOutcome[Nothing]
         )
 
-      Async[F]
-        .race(interrupted, work)
+      IO.race(interrupted, work)
         .map(_.merge)
         .handleError(error =>
           TaskOutcome.Failed(
@@ -237,12 +432,12 @@ object LocalSite:
         }
 
     private def publish(
-        registered: RegisteredOperation[F],
+        registered: RegisteredOperation[IO],
         resultBytes: Vector[Byte]
-    ): F[TaskOutcome[Nothing]] =
+    ): IO[TaskOutcome[Nothing]] =
       SchemaId.from(registered.descriptor.resultSchema.value) match
         case Left(failure) =>
-          Async[F].pure(
+          IO.pure(
             TaskOutcome.Failed(
               FailureDiagnosis(
                 FailureCause.ResultInvalid(Vector(failure.reason)),
@@ -320,17 +515,17 @@ object LocalSite:
         case OperationRunFailure.Execution(code, message) => s"$code: $message"
         case OperationRunFailure.InvalidResult(detail)    => detail
 
-    private def taskHandle[O](submissionKey: SubmissionKey, task: LocalTask[F]): TaskHandle[F, O] =
-      new TaskHandle[F, O]:
+    private def taskHandle[O](submissionKey: SubmissionKey, task: LocalTask): TaskHandle[IO, O] =
+      new TaskHandle[IO, O]:
         def key: SubmissionKey = submissionKey
 
-        def status: F[TaskStatus] =
+        def status: IO[TaskStatus] =
           for
             phase <- task.phase.get
-            now <- Clock[F].realTimeInstant
+            now <- IO.realTimeInstant
           yield TaskStatus(phase, Freshness.Current(now))
 
-        def await: F[TaskOutcome[O]] =
+        def await: IO[TaskOutcome[O]] =
           task.outcome.get.map(outcome => outcome: TaskOutcome[O])
 
-        def cancel: F[Unit] = task.cancelRequested.complete(()).void
+        def cancel: IO[Unit] = task.cancelRequested.complete(()).void
