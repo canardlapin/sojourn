@@ -41,15 +41,23 @@ object SojournEntryPoint:
   def parseOneShot(arguments: List[String]): Either[String, OneShotArguments] =
     def flag(name: String): Either[String, Path] =
       arguments.dropWhile(_ != name) match
-        case _ :: value :: _ => Right(Path.of(value))
-        case _               => Left(s"missing required argument $name <path>")
+        case _ :: value :: _ if !value.startsWith("--") => Right(Path.of(value))
+        case _ :: value :: _                            =>
+          Left(s"argument $name expects a path, found flag '$value'")
+        case _ => Left(s"missing required argument $name <path>")
     arguments match
       case "run" :: _ =>
         for
           invocation <- flag("--invocation")
           result <- flag("--result")
           events <- flag("--events")
-        yield OneShotArguments(invocation, result, events)
+          _ <- Option(result.toAbsolutePath.getParent)
+            .toRight("--result path must have a parent directory")
+        yield OneShotArguments(
+          invocation.toAbsolutePath,
+          result.toAbsolutePath,
+          events.toAbsolutePath
+        )
       case other => Left(s"unknown mode '${other.headOption.getOrElse("")}'; expected 'run'")
 
   def oneShot(
@@ -63,7 +71,11 @@ object SojournEntryPoint:
         IO.println(s"sojourn worker: invalid registry: ${failure.reason}").as(ExitCode.Error)
       case Right(taskRegistry) =>
         for
-          bytes <- IO.blocking(JFiles.readAllBytes(arguments.invocation).toVector)
+          size <- IO.blocking(JFiles.size(arguments.invocation))
+          bytes <-
+            if size > limits.maximumInvocationBytes.value.toLong then
+              IO.pure(Vector.empty[Byte]) // refused below by the codec's own bound
+            else IO.blocking(JFiles.readAllBytes(arguments.invocation).toVector)
           outcome <- TaskInvocationCodec.decode(
             bytes,
             limits.maximumInvocationBytes,

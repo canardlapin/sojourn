@@ -34,9 +34,11 @@ object DemoWorkerMain extends IOApp:
                 SojournEntryPoint.oneShot(arguments, registry, value)
 
   private def release: Either[String, WorkerRelease] =
-    val id = sys.env.getOrElse("SOJOURN_DEMO_RELEASE", "sojourn-demo-dev")
-    val digest = sys.env.getOrElse("SOJOURN_DEMO_RELEASE_DIGEST", "sha256:unversioned-dev-build")
     for
+      id <- sys.env.get("SOJOURN_DEMO_RELEASE").toRight("SOJOURN_DEMO_RELEASE is not set")
+      digest <- sys.env
+        .get("SOJOURN_DEMO_RELEASE_DIGEST")
+        .toRight("SOJOURN_DEMO_RELEASE_DIGEST is not set")
       releaseId <- WorkerReleaseId.from(id).left.map(_.reason)
       contentDigest <- ContentDigest.from(digest).left.map(_.reason)
     yield WorkerRelease(releaseId, contentDigest)

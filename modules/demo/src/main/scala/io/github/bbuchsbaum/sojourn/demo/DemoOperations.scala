@@ -72,7 +72,10 @@ object DemoOperations:
   /** Count observed `counting` executions: the number of marker files. */
   def executions(countDirectory: Path): IO[Long] =
     IO.blocking {
-      if Files.isDirectory(countDirectory) then Files.list(countDirectory).count()
+      if Files.isDirectory(countDirectory) then
+        val stream = Files.list(countDirectory)
+        try stream.count()
+        finally stream.close()
       else 0L
     }
 

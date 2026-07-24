@@ -75,63 +75,62 @@ object SlurmSite:
       config: SlurmSiteConfig,
       registry: OperationRegistry[IO]
   )(using Processes[IO]): Resource[IO, Site[IO]] =
+    // Acquisition order is release-order safety: the Supervisor is acquired innermost so that
+    // on release the drive fibers are cancelled FIRST (settling their handles as site-closed),
+    // before the controller and scheduler they use are finalized; the closed flag is acquired
+    // last of all so it flips first and stops new admissions.
     for
+      slurmConfig <- Resource.eval {
+        for
+          preflight <- SitePreflight.verify[IO](config.workspace)
+          _ <- preflight match
+            case Left(failure) =>
+              IO.raiseError(SlurmSiteUnavailable(describePreflight(failure)))
+            case Right(_) => IO.unit
+          slurmConfig <- IO.fromEither(
+            SlurmLocalConfig
+              .default(config.workspace.resolve("slurm-cli"), config.baseEnvironment)
+              .left
+              .map(failure => SlurmSiteUnavailable(failure.reason))
+          )
+        yield slurmConfig
+      }
+      scheduler <- SlurmLocal.default[IO](slurmConfig)
+      controller <- Managed.durable[IO](config.workspace.resolve("managed.journal"), scheduler)
       supervisor <- Supervisor[IO]
       closed <- Resource.make(Ref.of[IO, Boolean](false))(_.set(true))
-      site <- Resource
-        .eval {
-          for
-            preflight <- SitePreflight.verify[IO](config.workspace)
-            _ <- preflight match
-              case Left(failure) =>
-                IO.raiseError(SlurmSiteUnavailable(describePreflight(failure)))
-              case Right(_) => IO.unit
-            slurmConfig <- IO.fromEither(
-              SlurmLocalConfig
-                .default(config.workspace.resolve("slurm-cli"), config.baseEnvironment)
-                .left
-                .map(failure => SlurmSiteUnavailable(failure.reason))
+      site <- Resource.eval {
+        for
+          store <- FsSiteStore
+            .open[IO](
+              config.name,
+              config.workspace.resolve("store"),
+              config.maximumObjectBytes
             )
-          yield slurmConfig
-        }
-        .flatMap { slurmConfig =>
-          SlurmLocal.default[IO](slurmConfig).flatMap { scheduler =>
-            Managed
-              .durable[IO](config.workspace.resolve("managed.journal"), scheduler)
-              .evalMap { controller =>
-                for
-                  store <- FsSiteStore
-                    .open[IO](
-                      config.name,
-                      config.workspace.resolve("store"),
-                      config.maximumObjectBytes
-                    )
-                  tasks <- Ref.of[IO, Map[SubmissionKey, SlurmTask]](Map.empty)
-                  launcher = RegisteredTaskLauncher(
-                    WorkerLaunchSettings(
-                      workspace = config.workspace.resolve("tasks"),
-                      executable = config.workerExecutable,
-                      workerRelease = config.workerRelease,
-                      maximumInputBytes = config.maximumObjectBytes,
-                      maximumInvocationBytes = config.maximumEnvelopeBytes,
-                      maximumEnvelopeBytes = config.maximumEnvelopeBytes,
-                      maximumOutputBytes = config.maximumObjectBytes
-                    )
-                  )
-                yield new SlurmSiteImpl(
-                  config,
-                  registry,
-                  store,
-                  scheduler,
-                  controller,
-                  launcher,
-                  tasks,
-                  supervisor,
-                  closed
-                ): Site[IO]
-              }
-          }
-        }
+          tasks <- Ref.of[IO, Map[SubmissionKey, SlurmTask]](Map.empty)
+          launcher = RegisteredTaskLauncher(
+            WorkerLaunchSettings(
+              workspace = config.workspace.resolve("tasks"),
+              executable = config.workerExecutable,
+              workerRelease = config.workerRelease,
+              maximumInputBytes = config.maximumObjectBytes,
+              maximumInvocationBytes = config.maximumEnvelopeBytes,
+              maximumEnvelopeBytes = config.maximumEnvelopeBytes,
+              maximumOutputBytes = config.maximumObjectBytes
+            )
+          )
+        yield new SlurmSiteImpl(
+          config,
+          registry,
+          store,
+          scheduler,
+          controller,
+          launcher,
+          tasks,
+          supervisor,
+          closed
+        ): Site[IO]
+      }
     yield site
 
   private def describePreflight(failure: PreflightFailure): String =
@@ -143,14 +142,31 @@ object SlurmSite:
         s"workspace lacks exclusive create: $detail"
       case PreflightFailure.Io(detail) => s"workspace probe failed: $detail"
 
+  /** Evidence that cancellation was requested, with any delivery failures — read by the settle
+    * paths so a vanished/terminal task after a cancel request settles as Interrupted, and delivery
+    * problems surface in the outcome's diagnostics per the TaskHandle.cancel contract.
+    */
+  final private case class CancelEvidence(
+      requestedAt: java.time.Instant,
+      deliveryFailures: Vector[String]
+  )
+
+  /** What the poll loop last learned, and how: a successful observation (envelope check or
+    * scheduler answer) or a failed attempt with its evidence. Freshness derives from this — failed
+    * attempts surface as Freshness.Unknown, never as a fabricated Current stamp.
+    */
+  private enum ObservationState:
+    case Observed(at: java.time.Instant)
+    case AttemptFailed(at: java.time.Instant, detail: String)
+
   /** One accepted submission and its live state. */
   final private case class SlurmTask(
       descriptor: OperationDescriptor,
       inputIdentity: ContentDigest,
       phase: Ref[IO, TaskPhase],
-      lastObserved: Ref[IO, java.time.Instant],
+      observation: Ref[IO, ObservationState],
       outcome: Deferred[IO, TaskOutcome[Nothing]],
-      cancelRequested: Ref[IO, Boolean]
+      cancelRequested: Ref[IO, Option[CancelEvidence]]
   )
 
   final private class SlurmSiteImpl(
@@ -201,10 +217,11 @@ object SlurmSite:
               case Left(rejection)          => IO.pure(Left(rejection))
               case Right((value, identity)) =>
                 for
+                  now <- Clock[IO].realTimeInstant
                   phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
-                  observed <- Clock[IO].realTimeInstant.flatMap(Ref.of[IO, java.time.Instant](_))
+                  observed <- Ref.of[IO, ObservationState](ObservationState.Observed(now))
                   settled <- Deferred[IO, TaskOutcome[Nothing]]
-                  cancelRequested <- Ref.of[IO, Boolean](false)
+                  cancelRequested <- Ref.of[IO, Option[CancelEvidence]](None)
                   candidate = SlurmTask(
                     op.descriptor,
                     identity,
@@ -225,11 +242,34 @@ object SlurmSite:
                   handle <- decision match
                     case Left(rejection) => IO.pure(Left(rejection))
                     case Right(task)     =>
-                      val start =
-                        if task eq candidate then
-                          supervisor.supervise(drive(op, entry, value, key, task)).void
-                        else IO.unit
-                      start.as(Right(taskHandle[O](key, task)))
+                      if task eq candidate then
+                        // The drive fiber settles its handle if the site closes underneath it
+                        // (Supervisor cancellation), so awaiting callers always get an answer.
+                        // A supervise that raises means the site closed between the flag check
+                        // and here: withdraw the record and refuse honestly.
+                        supervisor
+                          .supervise(
+                            drive(op, entry, value, key, task).onCancel(
+                              settle(
+                                task,
+                                TaskOutcome.Unknown(
+                                  Diagnostics.one(
+                                    Diagnostic(
+                                      "site-closed",
+                                      "the site was released before this task settled"
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                          .attempt
+                          .flatMap {
+                            case Right(_) => IO.pure(Right(taskHandle[O](key, task)))
+                            case Left(_)  =>
+                              tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                          }
+                      else IO.pure(Right(taskHandle[O](key, task)))
                 yield handle
             }
       yield outcome
@@ -321,9 +361,11 @@ object SlurmSite:
             ): TaskOutcome[Nothing]
           )
         )
-        .flatMap { result =>
-          task.phase.set(TaskPhase.Settled) *> task.outcome.complete(result).void
-        }
+        .flatMap(settle(task, _))
+
+    /** Idempotently settle a task (first writer wins). */
+    private def settle(task: SlurmTask, result: TaskOutcome[Nothing]): IO[Unit] =
+      task.phase.set(TaskPhase.Settled) *> task.outcome.complete(result).void
 
     private def submitAndAwait[O](
         key: SubmissionKey,
@@ -370,39 +412,71 @@ object SlurmSite:
         task: SlurmTask,
         attempt: ManagedAttempt
     ): IO[TaskOutcome[Nothing]] =
-      def loop(terminalSince: Option[java.time.Instant]): IO[TaskOutcome[Nothing]] =
+      def loop(pendingSince: Option[(java.time.Instant, PendingEnd)]): IO[TaskOutcome[Nothing]] =
         for
           now <- Clock[IO].realTimeInstant
-          _ <- task.lastObserved.set(now)
           envelopePresent <- IO.blocking(JFiles.exists(prepared.resultPath))
           outcome <-
-            if envelopePresent then attach(prepared, contract, attempt, now)
+            if envelopePresent then
+              task.observation.set(ObservationState.Observed(now)) *>
+                attach(prepared, contract, attempt, now)
             else
               observeOnce(attempt).flatMap {
                 case Observed.Running =>
-                  task.phase.set(TaskPhase.Running) *> IO.sleep(config.pollEvery) *> loop(None)
+                  task.observation.set(ObservationState.Observed(now)) *>
+                    task.phase.set(TaskPhase.Running) *>
+                    IO.sleep(config.pollEvery) *> loop(None)
                 case Observed.Waiting =>
-                  IO.sleep(config.pollEvery) *> loop(None)
+                  task.observation.set(ObservationState.Observed(now)) *>
+                    IO.sleep(config.pollEvery) *> loop(None)
                 case Observed.Terminal(state) =>
-                  val since = terminalSince.getOrElse(now)
-                  val grace = java.time.Duration
-                    .between(since, now)
-                    .toMillis >= config.settleGrace.toMillis
-                  if grace then IO.pure(terminalWithoutResult(state))
-                  else IO.sleep(config.pollEvery) *> loop(Some(since))
-                case Observed.Unobservable(diagnostics) =>
+                  task.observation.set(ObservationState.Observed(now)) *> {
+                    val since = pendingSince match
+                      case Some((instant, PendingEnd.Terminal(_))) => instant
+                      case _                                       => now
+                    if graceElapsed(since, now) then
+                      task.cancelRequested.get.map(terminalWithoutResult(state, _))
+                    else
+                      IO.sleep(config.pollEvery) *> loop(Some((since, PendingEnd.Terminal(state))))
+                  }
+                case Observed.Vanished(detail) =>
+                  // The scheduler no longer lists the job. That is NOT an observation of any
+                  // terminal state — after the grace it settles honestly: Interrupted when we
+                  // requested cancellation (scancel raced the listing), Unknown otherwise.
+                  task.observation.set(ObservationState.Observed(now)) *> {
+                    val since = pendingSince match
+                      case Some((instant, PendingEnd.Vanished)) => instant
+                      case _                                    => now
+                    if graceElapsed(since, now) then
+                      task.cancelRequested.get.map(vanishedWithoutResult(detail, _))
+                    else IO.sleep(config.pollEvery) *> loop(Some((since, PendingEnd.Vanished)))
+                  }
+                case Observed.Unobservable(detail) =>
                   // Keep polling: the envelope may still arrive; the observation gap is evidence,
-                  // not an outcome. (A walltime-scale bound arrives with lease integration.)
-                  IO.sleep(config.pollEvery) *> loop(terminalSince)
+                  // not an outcome — and the status surface says so via Freshness.Unknown.
+                  // (A walltime-scale bound arrives with lease integration.)
+                  task.observation.set(ObservationState.AttemptFailed(now, detail)) *>
+                    IO.sleep(config.pollEvery) *> loop(pendingSince)
               }
         yield outcome
       loop(None)
+
+    private def graceElapsed(since: java.time.Instant, now: java.time.Instant): Boolean =
+      java.time.Duration.between(since, now).toMillis >= config.settleGrace.toMillis
+
+    /** What a grace window is waiting out: a listed terminal state, or a vanished listing. */
+    private enum PendingEnd:
+      case Terminal(state: SlurmState)
+      case Vanished
 
     private enum Observed:
       case Waiting
       case Running
       case Terminal(state: SlurmState)
-      case Unobservable(diagnostics: String)
+
+      /** The scheduler answered and the job is not listed — distinct from a failed attempt. */
+      case Vanished(detail: String)
+      case Unobservable(detail: String)
 
     private def observeOnce(attempt: ManagedAttempt): IO[Observed] =
       attempt.currentJob match
@@ -411,32 +485,36 @@ object SlurmSite:
           scheduler.observe(cats.data.NonEmptyVector.one(job)).map {
             case SchedulerQueryResult.Succeeded(batch) =>
               batch.results.head match
-                case ObservationResult.Observed(observation) =>
-                  observation.state match
-                    case SlurmState.Running | SlurmState.Completing => Observed.Running
-                    case SlurmState.Pending                         => Observed.Waiting
-                    case state if isTerminal(state)                 => Observed.Terminal(state)
-                    case _                                          => Observed.Waiting
-                case ObservationResult.NotFound(_, _, _) =>
-                  // squeue no longer lists finished jobs; treat as terminal-pending-envelope.
-                  Observed.Terminal(SlurmState.Completed)
-                case ObservationResult.Failed(_, _, _, _) =>
-                  Observed.Unobservable("observation failed")
+                case ObservationResult.Observed(observation) => classify(observation.state)
+                case ObservationResult.NotFound(_, _, _)     =>
+                  Observed.Vanished("job not listed by squeue")
+                case ObservationResult.Failed(_, _, diagnostics, _) =>
+                  Observed.Unobservable(
+                    diagnostics.values.toVector.map(d => s"${d.code}: ${d.message}").mkString("; ")
+                  )
             case SchedulerQueryResult.Empty(_, _) =>
-              Observed.Unobservable("empty observation")
+              Observed.Vanished("empty squeue answer for the job")
             case SchedulerQueryResult.InvocationFailed(_) =>
               Observed.Unobservable("squeue invocation failed")
             case SchedulerQueryResult.ParseFailed(_, _) =>
               Observed.Unobservable("squeue parse failed")
           }
 
-    private def isTerminal(state: SlurmState): Boolean =
-      state match
-        case SlurmState.Completed | SlurmState.Failed | SlurmState.Cancelled |
-            SlurmState.OutOfMemory | SlurmState.TimedOut | SlurmState.NodeFailure |
-            SlurmState.Preempted | SlurmState.SpecialExit =>
-          true
-        case _ => false
+    /** Exhaustive over SlurmState — the compiler polices every new upstream case. Requeue states
+      * keep waiting (the job will run again under the same identity — discussed, not silent); an
+      * unrecognized listed state is an observation we cannot classify, never 'still waiting'.
+      */
+    private def classify(state: SlurmState): Observed = state match
+      case SlurmState.Running | SlurmState.Completing => Observed.Running
+      case SlurmState.Pending                         => Observed.Waiting
+      case SlurmState.Requeued | SlurmState.RequeueHeld | SlurmState.RequeueFederation =>
+        Observed.Waiting
+      case SlurmState.Completed | SlurmState.Failed | SlurmState.Cancelled |
+          SlurmState.OutOfMemory | SlurmState.TimedOut | SlurmState.NodeFailure |
+          SlurmState.Preempted | SlurmState.SpecialExit =>
+        Observed.Terminal(state)
+      case SlurmState.Unknown(raw) =>
+        Observed.Unobservable(s"unrecognized scheduler state '$raw'")
 
     private def attach[O](
         prepared: PreparedRegisteredSubmission[O],
@@ -481,7 +559,11 @@ object SlurmSite:
         contract: ResultContract.Structured[O]
     ): IO[TaskOutcome[Nothing]] =
       for
-        bytes <- IO.blocking(JFiles.readAllBytes(prepared.resultPath).toVector)
+        size <- IO.blocking(JFiles.size(prepared.resultPath))
+        bytes <-
+          if size > config.maximumEnvelopeBytes.value.toLong then
+            IO.pure(Vector.empty[Byte]) // refused below by the codec's own bound
+          else IO.blocking(JFiles.readAllBytes(prepared.resultPath).toVector)
         outcome <- ResultEnvelopeCodec.decode(
           bytes,
           config.maximumEnvelopeBytes,
@@ -538,22 +620,73 @@ object SlurmSite:
                     }
       yield outcome
 
-    private def terminalWithoutResult(state: SlurmState): TaskOutcome[Nothing] =
+    /** A listed terminal state with no envelope after the grace. Exhaustive over InterruptionClass;
+      * classification uncertainty settles as Unknown, never a fabricated interruption.
+      * Cancel-request evidence (and any delivery failures) rides the diagnostics.
+      */
+    private def terminalWithoutResult(
+        state: SlurmState,
+        cancel: Option[CancelEvidence]
+    ): TaskOutcome[Nothing] =
       InterruptionClass.classify(state) match
         case InterruptionClass.NotInterrupted | InterruptionClass.WorkloadFailure =>
           TaskOutcome.Failed(
             FailureDiagnosis(
-              FailureCause.ProgramFailed(None, Vector("terminal-without-envelope", state.toString)),
+              FailureCause.ProgramFailed(
+                None,
+                Vector("terminal-without-envelope", state.toString) ++ cancelCodes(cancel)
+              ),
               Vector.empty,
               Vector.empty
             )
           )
-        case _ =>
-          TaskOutcome.Interrupted(
+        case InterruptionClass.Requeueing | InterruptionClass.InfrastructureFailure |
+            InterruptionClass.SchedulerPolicy | InterruptionClass.Cancellation =>
+          TaskOutcome.Interrupted(interruptDiagnostics(state.toString, cancel))
+        case InterruptionClass.Unknown =>
+          TaskOutcome.Unknown(
             Diagnostics.one(
-              Diagnostic("interrupted", s"scheduler terminal state ${state.toString} before result")
+              Diagnostic(
+                "terminal-unclassified",
+                s"terminal state ${state.toString} with no envelope and no classification"
+              )
             )
           )
+
+    /** The scheduler stopped listing the job and no envelope arrived within the grace. Never a
+      * fabricated observation: Interrupted when cancellation was requested (scancel raced the
+      * listing), otherwise honestly Unknown.
+      */
+    private def vanishedWithoutResult(
+        detail: String,
+        cancel: Option[CancelEvidence]
+    ): TaskOutcome[Nothing] =
+      cancel match
+        case Some(_) => TaskOutcome.Interrupted(interruptDiagnostics(detail, cancel))
+        case None    =>
+          TaskOutcome.Unknown(
+            Diagnostics.one(
+              Diagnostic("job-not-listed", s"$detail; no envelope after the settle grace")
+            )
+          )
+
+    private def interruptDiagnostics(
+        detail: String,
+        cancel: Option[CancelEvidence]
+    ): Diagnostics =
+      Diagnostics.one(
+        Diagnostic(
+          "interrupted",
+          (Vector(detail) ++ cancelCodes(cancel)).mkString("; ")
+        )
+      )
+
+    private def cancelCodes(cancel: Option[CancelEvidence]): Vector[String] =
+      cancel match
+        case None           => Vector.empty
+        case Some(evidence) =>
+          Vector(s"cancel-requested-at=${evidence.requestedAt}") ++
+            evidence.deliveryFailures.map(failure => s"cancel-delivery-failed=$failure")
 
     private def workloadFailed(outcome: WorkloadOutcome): TaskOutcome[Nothing] =
       val cause = outcome match
@@ -608,24 +741,42 @@ object SlurmSite:
         def status: IO[TaskStatus] =
           for
             phase <- task.phase.get
-            observedAt <- task.lastObserved.get
+            observation <- task.observation.get
             now <- Clock[IO].realTimeInstant
-            age = java.time.Duration.between(observedAt, now).toMillis
-            freshness <-
-              if age <= config.pollEvery.toMillis * 2 then IO.pure(Freshness.Current(observedAt))
-              else
-                IO.fromEither(
-                  DurationMillis
-                    .from(age)
-                    .left
-                    .map(failure => new IllegalStateException(failure.reason))
-                ).map(Freshness.Stale(observedAt, _))
+            freshness <- observation match
+              case ObservationState.AttemptFailed(at, detail) =>
+                IO.pure(
+                  Freshness.Unknown(at, Diagnostics.one(Diagnostic("observation-failed", detail)))
+                )
+              case ObservationState.Observed(at) =>
+                val age = java.time.Duration.between(at, now).toMillis
+                if age <= config.pollEvery.toMillis * 2 then IO.pure(Freshness.Current(at))
+                else
+                  IO.fromEither(
+                    DurationMillis
+                      .from(math.max(age, 1L))
+                      .left
+                      .map(failure => new IllegalStateException(failure.reason))
+                  ).map(Freshness.Stale(at, _))
           yield TaskStatus(phase, freshness)
 
         def await: IO[TaskOutcome[O]] =
           task.outcome.get.map(outcome => outcome: TaskOutcome[O])
 
         def cancel: IO[Unit] =
-          task.cancelRequested.set(true) *>
-            controller.requestCancellation(submissionKey).attempt.void *>
-            controller.dispatchCancellation(submissionKey).attempt.void
+          for
+            now <- Clock[IO].realTimeInstant
+            requested <- controller.requestCancellation(submissionKey).attempt
+            dispatched <- controller.dispatchCancellation(submissionKey).attempt
+            failures = Vector(requested, dispatched).flatMap {
+              case Right(Left(controlFailure)) => Vector(controlFailure.toString)
+              case Right(Right(_))             => Vector.empty
+              case Left(error)                 =>
+                Vector(Option(error.getMessage).getOrElse(error.getClass.getSimpleName))
+            }
+            _ <- task.cancelRequested.update {
+              case Some(existing) =>
+                Some(existing.copy(deliveryFailures = existing.deliveryFailures ++ failures))
+              case None => Some(CancelEvidence(now, failures))
+            }
+          yield ()

@@ -105,12 +105,13 @@ object SlurmTckEnvironment:
       val releaseId = WorkerReleaseId.from(s"sojourn-demo-${digestHex.take(16)}").toOption.get
       val release = WorkerRelease(releaseId, digest)
       val wrapper = workspace.resolve("sojourn-demo-worker.sh")
+      def quoted(value: String): String = "'" + value.replace("'", "'\\''") + "'"
       val script =
         s"""#!/bin/sh
-           |export SOJOURN_DEMO_COUNT_DIR='${countDirectory}'
-           |export SOJOURN_DEMO_RELEASE='${releaseId.value}'
-           |export SOJOURN_DEMO_RELEASE_DIGEST='${digest.value}'
-           |exec java -jar '${jar}' "$$@"
+           |export SOJOURN_DEMO_COUNT_DIR=${quoted(countDirectory.toString)}
+           |export SOJOURN_DEMO_RELEASE=${quoted(releaseId.value)}
+           |export SOJOURN_DEMO_RELEASE_DIGEST=${quoted(digest.value)}
+           |exec java -jar ${quoted(jar.toString)} "$$@"
            |""".stripMargin
       Files.write(wrapper, script.getBytes(StandardCharsets.UTF_8))
       val _ = Files.setPosixFilePermissions(wrapper, PosixFilePermissions.fromString("rwxr-xr-x"))
