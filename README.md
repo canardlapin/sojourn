@@ -30,9 +30,15 @@ revisit before 1.0.
 
 ## Build
 
-JDK 17+, Scala 3.7.4. Until scala-slurm publishes artifacts, resolve it locally:
+JDK 17+, Scala 3.7.4. Until scala-slurm publishes artifacts, resolve it locally.
+`scala-slurm.sha` pins the exact scala-slurm commit this tree is built and tested
+against — bump it deliberately (it is a reviewed diff), republish, and re-test:
 
 ```shell
-cd ../scala-slurm && sbt 'set ThisBuild/version := "0.1.0-SNAPSHOT"' core/publishLocal
+cd ../scala-slurm && git checkout "$(cat ../sojourn/scala-slurm.sha)" \
+  && sbt 'set ThisBuild/version := "0.1.0-SNAPSHOT"' +publishLocal
 cd ../sojourn && sbt test
 ```
+
+When both repos have Git remotes, CI consumes the pin the same way: clone
+scala-slurm, check out the pinned sha, `+publishLocal`, then build sojourn.
