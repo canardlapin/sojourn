@@ -43,13 +43,28 @@ class LayoutSuite extends munit.ScalaCheckSuite:
         for
           spoolRoot <- SitePath.from(root)
           id <- PilotId.from(pilot)
+          manifest <- SpoolLayout.poolManifest(spoolRoot)
           pending <- SpoolLayout.pendingDir(spoolRoot)
           results <- SpoolLayout.resultsDir(spoolRoot)
           claimed <- SpoolLayout.claimedDir(spoolRoot, id)
+          done <- SpoolLayout.doneDir(spoolRoot, id)
+          reclaimed <- SpoolLayout.reclaimedDir(spoolRoot, id)
+          poolReclaimed <- SpoolLayout.poolReclaimedDir(spoolRoot)
           registration <- SpoolLayout.registrationFile(spoolRoot, id)
           heartbeat <- SpoolLayout.heartbeatFile(spoolRoot, id)
           drain <- SpoolLayout.drainMarker(spoolRoot)
-        yield Vector(pending, results, claimed, registration, heartbeat, drain).map(_.value)
+        yield Vector(
+          manifest,
+          pending,
+          results,
+          claimed,
+          done,
+          reclaimed,
+          poolReclaimed,
+          registration,
+          heartbeat,
+          drain
+        ).map(_.value)
       entries match
         case Right(paths) => paths.forall(_.startsWith(root + "/"))
         case Left(_)      => false
@@ -59,6 +74,16 @@ class LayoutSuite extends munit.ScalaCheckSuite:
   test("layout entries have the documented suffixes") {
     val root = SitePath.from("spool/pool").toOption.get
     val pilot = PilotId.from("pilot.01").toOption.get
+    assertEquals(SpoolLayout.poolManifest(root).map(_.value), Right("spool/pool/pool.manifest"))
+    assertEquals(SpoolLayout.doneDir(root, pilot).map(_.value), Right("spool/pool/done/pilot.01"))
+    assertEquals(
+      SpoolLayout.reclaimedDir(root, pilot).map(_.value),
+      Right("spool/pool/reclaimed/pilot.01")
+    )
+    assertEquals(
+      SpoolLayout.poolReclaimedDir(root).map(_.value),
+      Right("spool/pool/reclaimed/_pool")
+    )
     assertEquals(SpoolLayout.pendingDir(root).map(_.value), Right("spool/pool/pending"))
     assertEquals(SpoolLayout.resultsDir(root).map(_.value), Right("spool/pool/results"))
     assertEquals(
