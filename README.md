@@ -13,20 +13,35 @@ backend cannot abstract away — the queue and the walltime lease — are modele
 the types instead (`LeaseState`, total `TaskOutcome`, `Unknown` as a case rather
 than an exception).
 
-Design: `docs/architecture/0001-site-layer.md`. Master plan:
-`../scala-slurm/docs/plans/2026-07-23-site-layer.md` (phases 3b–3e land here).
+Backend-neutrality is a **tested property, not an intention**: a published
+conformance kit (`sojourn-tck`) states the laws any `Site` implementation must
+satisfy, and two backends pass them — a scheduler-free local backend (all 25
+laws: store, batch, pool, batch/pool parity) and the exemplary Slurm backend
+(store + batch laws, run against a real Slurm controller when
+`SOJOURN_SLURM_TCK_WORKSPACE`/`_JAR` are set; pool wiring is the next
+milestone).
+
+Design: `docs/architecture/0001-site-layer.md` (site layer) and
+`docs/architecture/0002-spool-runtime.md` (spool runtime semantics: the reclaim
+evidence ladder, epoch fence, clock-free heartbeat staleness, drain, and lease
+machine). Program plan: `docs/plans/2026-07-24-remote-executor.md`.
 
 ## Modules
 
 | Module | Boundary |
 | --- | --- |
-| `sojourn-core` | Typed site/lease/task surface, validated identifiers, spool wire protocol v1 with canonical codecs |
+| `sojourn-core` | Pure SPI (`Site`, `SiteStore`, `TaskRunner`, `LeasedPool`, `LeaseState`, total `TaskOutcome`), validated identifiers, spool wire protocol v1 with canonical codecs + golden fixtures |
+| `sojourn-runtime` | Scheduler-neutral effectful machinery: content-addressed shared-FS store, operation registry, site preflight probes, the one worker binary (one-shot + pilot modes), pilot loop, pool dispatcher (reclaim ladder, epoch fence, lease governance) |
+| `sojourn-local` | Scheduler-free backend: batch on supervised fibers, pool as in-process pilots over a real filesystem spool — the neutrality proof and dev-mode |
+| `sojourn-slurm` | The exemplary Slurm backend: durable managed submission, typed staging, strict digest-verified result attachment over a shared workspace |
+| `sojourn-tck` | Published conformance suites (`StoreTck`, `BatchTck`, `PoolTck`, `ParityTck`) any backend instantiates over a `TckHarness` |
+| `sojourn-demo` | Unpublished demo operations + the assembled worker binary used by tests and acceptance |
 
-Known coupling: `sojourn-core` depends on `scala-slurm-core` for the shared
-identifier/evidence vocabulary (`SubmissionKey`, `ContentDigest`, `Freshness`,
-`Diagnostics`, …). That module is pure data — no scheduler runtime crosses the
-boundary — but true provider-neutrality would require extracting that vocabulary;
-revisit before 1.0.
+Known coupling: sojourn borrows scala-slurm-core's identifier/evidence
+vocabulary (`SubmissionKey`, `ContentDigest`, `Freshness`, `Diagnostics`, …) and
+scala-slurm-worker's `AtomicFiles` kernel. Both are pure data / scheduler-free —
+no scheduler runtime crosses the boundary — but true provider-neutrality would
+require extracting that vocabulary; recorded as a pre-1.0 phase.
 
 ## Build
 
