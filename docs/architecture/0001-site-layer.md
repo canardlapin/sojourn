@@ -1,4 +1,4 @@
-# ADR 0010: Scheduler-neutral site layer with leased pilot pools
+# ADR 0001: Scheduler-neutral site layer with leased pilot pools
 
 - Status: accepted; kernel only, integration pending
 - Date: 2026-07-23
