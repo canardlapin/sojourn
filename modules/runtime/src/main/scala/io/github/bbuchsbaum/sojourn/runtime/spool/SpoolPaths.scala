@@ -2,11 +2,11 @@ package io.github.bbuchsbaum.sojourn.runtime.spool
 
 import cats.effect.kernel.Sync
 import cats.syntax.all.*
-import io.github.bbuchsbaum.scalaslurm.core.AttemptEpoch
-import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
+import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.runtime.KeyToken
 import io.github.bbuchsbaum.sojourn.spool.PilotHeartbeat

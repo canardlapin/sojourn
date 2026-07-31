@@ -1,6 +1,6 @@
 package io.github.bbuchsbaum.sojourn.runtime
 
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest

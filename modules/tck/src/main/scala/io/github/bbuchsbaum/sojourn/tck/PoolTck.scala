@@ -2,7 +2,7 @@ package io.github.bbuchsbaum.sojourn.tck
 
 import cats.effect.IO
 import cats.effect.Resource
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.sojourn.LeaseEvent
 import io.github.bbuchsbaum.sojourn.LeaseRevocation
 import io.github.bbuchsbaum.sojourn.LeaseState.awaitGranted
@@ -65,7 +65,7 @@ abstract class PoolTck extends CatsEffectSuite:
         .map(_.toOption.get)
       outcome <- handle.await
       _ <- outcome match
-        case TaskOutcome.Succeeded(ref) =>
+        case TaskOutcome.Succeeded(ref, _) =>
           h.site.store.fetch(ref, TckWire.stringResult).map { value =>
             assertEquals(value, Right("echo:hello"))
           }
@@ -121,8 +121,8 @@ abstract class PoolTck extends CatsEffectSuite:
             .map(_.toOption.get)
           outcome <- handle.await
           _ <- outcome match
-            case TaskOutcome.Succeeded(_) => IO.unit
-            case other                    => IO(fail(s"expected Succeeded, observed $other"))
+            case TaskOutcome.Succeeded(_, _) => IO.unit
+            case other                       => IO(fail(s"expected Succeeded, observed $other"))
         yield (h, pool)
       }
       .flatMap { case (h, pool: LeasedPool[IO]) =>

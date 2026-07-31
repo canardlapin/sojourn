@@ -1,8 +1,8 @@
 package io.github.bbuchsbaum.sojourn
 
-import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
-import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
-import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
+import io.github.bbuchsbaum.remoteexec.kernel.DurationMillis
+import io.github.bbuchsbaum.remoteexec.kernel.PositiveInt
+import io.github.bbuchsbaum.remoteexec.kernel.WallTimeMinutes
 import org.scalacheck.Gen
 import org.scalacheck.Prop.forAll
 
@@ -129,10 +129,10 @@ class SiteModelSuite extends munit.ScalaCheckSuite:
   test("OperationCatalog rejects the same id+version with different schemas") {
     def descriptor(id: String, version: String, in: String, out: String) =
       OperationDescriptor(
-        io.github.bbuchsbaum.scalaslurm.core.OperationId.from(id).toOption.get,
-        io.github.bbuchsbaum.scalaslurm.core.OperationVersion.from(version).toOption.get,
-        io.github.bbuchsbaum.scalaslurm.core.SchemaId.from(in).toOption.get,
-        io.github.bbuchsbaum.scalaslurm.core.ResultSchemaId.from(out).toOption.get
+        io.github.bbuchsbaum.remoteexec.kernel.OperationId.from(id).toOption.get,
+        io.github.bbuchsbaum.remoteexec.kernel.OperationVersion.from(version).toOption.get,
+        io.github.bbuchsbaum.remoteexec.kernel.SchemaId.from(in).toOption.get,
+        io.github.bbuchsbaum.remoteexec.kernel.ResultSchemaId.from(out).toOption.get
       )
     val echo = descriptor("example.echo", "1", "in.v1", "out.v1")
     val drifted = descriptor("example.echo", "1", "in.v2", "out.v1")

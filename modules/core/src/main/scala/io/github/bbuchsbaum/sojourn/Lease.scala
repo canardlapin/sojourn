@@ -3,8 +3,8 @@ package io.github.bbuchsbaum.sojourn
 import cats.effect.kernel.Concurrent
 import cats.syntax.all.*
 import fs2.Stream
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostics
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostics
 
 import java.time.Instant
 

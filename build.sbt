@@ -14,6 +14,7 @@ ThisBuild / tlCiScalafmtCheck := true
 ThisBuild / tlCiHeaderCheck := false
 ThisBuild / scalacOptions += "-Xmax-inlines:64"
 ThisBuild / Test / fork := true
+ThisBuild / dependencyOverrides += Libraries.munit
 
 lazy val root = project
   .in(file("."))
@@ -22,14 +23,14 @@ lazy val root = project
   .settings(name := "sojourn")
 
 // The scheduler-neutral kernel: typed site/lease/task surface plus the spool
-// wire protocol. Depends on scala-slurm-core for the shared identifier and
-// evidence vocabulary only; no scheduler runtime crosses this boundary.
+// wire protocol. Its only cross-repository dependency is the provider-neutral
+// remote-exec kernel; no scheduler runtime crosses this boundary.
 lazy val core = project
   .in(file("modules/core"))
   .settings(
     name := "sojourn-core",
     libraryDependencies ++= Seq(
-      Libraries.scalaSlurmCore,
+      Libraries.remoteExecKernel,
       Libraries.catsEffect,
       Libraries.fs2Core,
       Libraries.fs2Io,
@@ -45,14 +46,15 @@ lazy val core = project
 // Scheduler-neutral effectful machinery: the content-addressed shared-filesystem
 // store, the operation registry, the one-binary entry point (one-shot batch mode
 // now; pilot mode arrives with the spool runtime), site preflight probes, and
-// release staging. Depends on scala-slurm worker for the AtomicFiles kernel and
-// the envelope/publication discipline — worker is scheduler-free.
+// release staging. Atomic publication comes directly from the provider-neutral
+// remote-exec kernel.
 lazy val runtime = project
   .in(file("modules/runtime"))
   .dependsOn(core)
   .settings(
     name := "sojourn-runtime",
     libraryDependencies ++= Seq(
+      Libraries.remoteExecKernel,
       Libraries.scalaSlurmWorker,
       Libraries.scalaSlurmProtocol,
       Libraries.catsEffect,
@@ -93,6 +95,7 @@ lazy val slurm = project
     libraryDependencies ++= Seq(
       Libraries.scalaSlurmManaged,
       Libraries.scalaSlurmLocal,
+      Libraries.scalaSlurmSsh,
       Libraries.munit % Test,
       Libraries.munitCatsEffect % Test
     )

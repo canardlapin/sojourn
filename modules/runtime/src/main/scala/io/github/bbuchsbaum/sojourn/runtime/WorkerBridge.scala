@@ -1,16 +1,18 @@
 package io.github.bbuchsbaum.sojourn.runtime
 
 import cats.effect.IO
-import io.github.bbuchsbaum.scalaslurm.core.InputCodec
-import io.github.bbuchsbaum.scalaslurm.core.OperationRef
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodec
-import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
+import fs2.Stream
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
+import io.github.bbuchsbaum.scalaslurm.core.RelativeOutputPath
 import io.github.bbuchsbaum.scalaslurm.worker.ScalaTask
 import io.github.bbuchsbaum.scalaslurm.worker.TaskContext
 import io.github.bbuchsbaum.scalaslurm.worker.TaskRegistration
 import io.github.bbuchsbaum.scalaslurm.worker.TaskRegistry
-import io.github.bbuchsbaum.sojourn.SiteOperation
+import io.github.bbuchsbaum.sojourn.ArtifactOutput
+import io.github.bbuchsbaum.sojourn.ArtifactPath
+import io.github.bbuchsbaum.sojourn.ArtifactReceipt
+import io.github.bbuchsbaum.sojourn.ArtifactWriteFailure
+import io.github.bbuchsbaum.sojourn.OperationContext
 
 /** Bridges a sojourn [[OperationRegistry]] to a scala-slurm worker `TaskRegistry`, so the same
   * registered operations execute identically whether invoked by the local backend, a one-shot batch
@@ -32,17 +34,62 @@ object WorkerBridge:
 
   private def bridgeTask[I, O](entry: OperationRegistry.Entry[IO, I, O]): ScalaTask[I, O] =
     new ScalaTask[I, O]:
-      def operation: OperationRef[I, O] = operationRef(entry.operation)
-      def inputCodec: InputCodec[I] = entry.input
-      def outputCodec: ResultCodec[O] = entry.result
-      override def retrySafety: RetrySafety = entry.retrySafety
-      def run(input: I, context: TaskContext[IO]): IO[O] = entry.run(input)
+      def operation = entry.operation.reference
+      def inputCodec = entry.operation.input
+      def outputCodec = entry.operation.result
+      override def retrySafety = entry.operation.retrySafety
+      def run(input: I, context: TaskContext[IO]): IO[O] =
+        entry.run(input, OperationContext(workerArtifacts(entry, context)))
 
-  /** A [[SiteOperation]] and an `OperationRef` share the same wire identity fields. */
-  def operationRef[I, O](operation: SiteOperation[I, O]): OperationRef[I, O] =
-    OperationRef(
-      operation.id,
-      operation.version,
-      operation.inputSchema,
-      operation.resultSchema
-    )
+  private def workerArtifacts[I, O](
+      entry: OperationRegistry.Entry[IO, I, O],
+      context: TaskContext[IO]
+  ): ArtifactOutput[IO] =
+    new ArtifactOutput[IO]:
+      def write(
+          path: ArtifactPath,
+          bytes: Stream[IO, Byte]
+      ): IO[Either[ArtifactWriteFailure, ArtifactReceipt]] =
+        entry.operation.artifacts.get(path) match
+          case None              => IO.pure(Left(ArtifactWriteFailure.Undeclared(path)))
+          case Some(declaration) =>
+            RelativeOutputPath.from(path.value) match
+              case Left(problem) =>
+                IO.pure(
+                  Left(ArtifactWriteFailure.Unavailable(path, problem.reason))
+                )
+              case Right(relative) =>
+                val maximum = declaration.maximumBytes.value
+                bytes
+                  .take(maximum.toLong + 1L)
+                  .compile
+                  .toVector
+                  .flatMap { captured =>
+                    if captured.size > maximum then
+                      IO.pure(
+                        Left(
+                          ArtifactWriteFailure.TooLarge(
+                            path,
+                            captured.size.toLong,
+                            maximum
+                          )
+                        )
+                      )
+                    else
+                      context.outputs
+                        .write(relative, captured, declaration.maximumBytes)
+                        .map {
+                          case Left(failure) =>
+                            Left(ArtifactWriteFailure.Unavailable(path, failure.toString))
+                          case Right(output) =>
+                            Right(ArtifactReceipt(path, output.sizeBytes, output.digest))
+                        }
+                  }
+                  .handleError(error =>
+                    Left(
+                      ArtifactWriteFailure.Unavailable(
+                        path,
+                        Option(error.getMessage).getOrElse(error.getClass.getSimpleName)
+                      )
+                    )
+                  )

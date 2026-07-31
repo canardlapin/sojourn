@@ -3,25 +3,25 @@ package io.github.bbuchsbaum.sojourn.runtime.spool
 import cats.effect.IO
 import cats.effect.Resource
 import cats.effect.kernel.Ref
-import io.github.bbuchsbaum.scalaslurm.core.AttemptEpoch
-import io.github.bbuchsbaum.scalaslurm.core.AttemptId
-import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
-import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
-import io.github.bbuchsbaum.scalaslurm.core.InputCodec
-import io.github.bbuchsbaum.scalaslurm.core.OperationId
-import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
-import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodec
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodecFailure
-import io.github.bbuchsbaum.scalaslurm.core.ResultSchemaId
-import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
-import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
-import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
+import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
+import io.github.bbuchsbaum.remoteexec.kernel.DurationMillis
+import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
+import io.github.bbuchsbaum.remoteexec.kernel.OperationId
+import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
+import io.github.bbuchsbaum.remoteexec.kernel.PositiveInt
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodecFailure
+import io.github.bbuchsbaum.remoteexec.kernel.ResultSchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
+import io.github.bbuchsbaum.remoteexec.kernel.WallTimeMinutes
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
 import io.github.bbuchsbaum.sojourn.LeaseEvent
 import io.github.bbuchsbaum.sojourn.LeaseRevocation
 import io.github.bbuchsbaum.sojourn.LeasedPool
@@ -88,8 +88,9 @@ class PoolDispatcherSuite extends CatsEffectSuite:
     SiteOperation(
       OperationId.from("sojourn.test.echo").toOption.get,
       OperationVersion.from("1").toOption.get,
-      stringInputSchema,
-      stringResultSchema
+      stringInput,
+      stringResult,
+      RetrySafety.SafeForAutomaticRetry
     )
 
   /** Declared NOT safe for automatic retry — the R3 quarantine gate's subject. */
@@ -97,26 +98,17 @@ class PoolDispatcherSuite extends CatsEffectSuite:
     SiteOperation(
       OperationId.from("sojourn.test.fragile").toOption.get,
       OperationVersion.from("1").toOption.get,
-      stringInputSchema,
-      stringResultSchema
+      stringInput,
+      stringResult,
+      RetrySafety.NoAutomaticRetry
     )
 
   private def registry: OperationRegistry[IO] =
     OperationRegistry
       .from[IO](
         Vector(
-          OperationRegistry.entry(
-            echoOp,
-            stringInput,
-            stringResult,
-            RetrySafety.SafeForAutomaticRetry
-          )(input => IO.pure(s"echo:$input")),
-          OperationRegistry.entry(
-            fragileOp,
-            stringInput,
-            stringResult,
-            RetrySafety.NoAutomaticRetry
-          )(input => IO.pure(s"fragile:$input"))
+          OperationRegistry.entry(echoOp)(input => IO.pure(s"echo:$input")),
+          OperationRegistry.entry(fragileOp)(input => IO.pure(s"fragile:$input"))
         )
       )
       .toOption
@@ -308,8 +300,9 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           _ <- claimByPilot(env, key, AttemptEpoch.initial)
           outcome <- handle.await.timeout(15.seconds)
           _ <- outcome match
-            case TaskOutcome.Succeeded(settled) => IO(assertEquals(settled.digest, ref.digest))
-            case other                          => IO(fail(s"expected Succeeded, observed $other"))
+            case TaskOutcome.Succeeded(settled, _) =>
+              IO(assertEquals(settled.digest, ref.digest))
+            case other => IO(fail(s"expected Succeeded, observed $other"))
           // The reclaim happened (tombstone recorded as evidence) but was voided by the result.
           tombstones <- eventually(
             env.spool
@@ -354,7 +347,7 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           rebumped <- pendingExists(env, key, epochThree)
         yield
           outcome match
-            case TaskOutcome.Succeeded(settled) =>
+            case TaskOutcome.Succeeded(settled, _) =>
               assertEquals(settled.digest, currentRef.digest)
               assertNotEquals(settled.digest, staleRef.digest)
             case other => fail(s"expected Succeeded from the current epoch, observed $other")

@@ -3,10 +3,10 @@ package io.github.bbuchsbaum.sojourn.runtime.spool
 import cats.effect.IO
 import cats.effect.kernel.Ref
 import cats.effect.std.Mutex
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
 import io.github.bbuchsbaum.sojourn.OperationDescriptor
 import io.github.bbuchsbaum.sojourn.StoreFailure
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore

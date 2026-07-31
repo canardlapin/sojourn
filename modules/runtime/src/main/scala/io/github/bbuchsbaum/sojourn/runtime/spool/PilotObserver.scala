@@ -1,6 +1,6 @@
 package io.github.bbuchsbaum.sojourn.runtime.spool
 
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
 import io.github.bbuchsbaum.sojourn.spool.PilotId
 
 /** The backend's current view of one pilot's allocation — the observation input to the reclaim

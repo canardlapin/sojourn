@@ -3,8 +3,8 @@ package io.github.bbuchsbaum.sojourn.runtime
 import cats.effect.ExitCode
 import cats.effect.IO
 import cats.effect.std.Console
-import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
+import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
 import io.github.bbuchsbaum.scalaslurm.protocol.TaskInvocationCodec
 import io.github.bbuchsbaum.scalaslurm.worker.FileResultPublisher
 import io.github.bbuchsbaum.scalaslurm.worker.FileTaskContext
@@ -202,8 +202,8 @@ object SojournEntryPoint:
                     )
                   )
               yield result match
-                case WorkerRunResult.Succeeded(_, _)           => ExitCode.Success
-                case WorkerRunResult.Failed(_, _, publication) =>
+                case WorkerRunResult.Succeeded(_, _, _)           => ExitCode.Success
+                case WorkerRunResult.Failed(_, _, publication, _) =>
                   // A published failure envelope is a delivered answer; no envelope is "no answer".
                   if publication.isDefined then ExitCode.Success else ExitCode.Error
         yield outcome

@@ -2,7 +2,7 @@ package io.github.bbuchsbaum.sojourn.tck
 
 import cats.effect.IO
 import cats.effect.Resource
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.sojourn.SubmitRejection
 import io.github.bbuchsbaum.sojourn.TaskInput
 import io.github.bbuchsbaum.sojourn.TaskOutcome
@@ -62,7 +62,7 @@ abstract class BatchTck extends CatsEffectSuite:
         .map(_.toOption.get)
       outcome <- handle.await
       _ <- outcome match
-        case TaskOutcome.Succeeded(ref) =>
+        case TaskOutcome.Succeeded(ref, _) =>
           h.site.store.fetch(ref, TckWire.stringResult).map { value =>
             assertEquals(value, Right("echo:hello"))
           }
@@ -124,7 +124,7 @@ abstract class BatchTck extends CatsEffectSuite:
         .map(_.toOption.get)
       outcome <- handle.await
       _ <- outcome match
-        case TaskOutcome.Succeeded(result) =>
+        case TaskOutcome.Succeeded(result, _) =>
           h.site.store.fetch(result, TckWire.stringResult).map { value =>
             assertEquals(value, Right("echo:world"))
           }

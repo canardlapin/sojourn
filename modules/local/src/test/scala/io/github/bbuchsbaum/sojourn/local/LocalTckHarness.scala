@@ -27,18 +27,24 @@ import scala.concurrent.duration.*
   * TCK operations, an execution counter, and out-of-band store corruption.
   */
 object LocalTckHarness:
-  private def operation(name: String): SiteOperation[String, String] =
+  private def operation(
+      name: String,
+      retrySafety: RetrySafety
+  ): SiteOperation[String, String] =
     SiteOperation(
       OperationId.from(s"sojourn.tck.$name").toOption.get,
       OperationVersion.from("1").toOption.get,
-      TckWire.stringInputSchema,
-      TckWire.stringResultSchema
+      TckWire.stringInput,
+      TckWire.stringResult,
+      retrySafety
     )
 
-  val echo: SiteOperation[String, String] = operation("echo")
-  val failing: SiteOperation[String, String] = operation("failing")
-  val sleepy: SiteOperation[String, String] = operation("sleepy")
-  val counting: SiteOperation[String, String] = operation("counting")
+  val echo: SiteOperation[String, String] =
+    operation("echo", RetrySafety.SafeForAutomaticRetry)
+  val failing: SiteOperation[String, String] = operation("failing", RetrySafety.Unknown)
+  val sleepy: SiteOperation[String, String] = operation("sleepy", RetrySafety.Unknown)
+  val counting: SiteOperation[String, String] =
+    operation("counting", RetrySafety.SafeForAutomaticRetry)
 
   /** Harness-appropriate small pool: two pilots, floor of one, short heartbeat, generous
     * ready-timeout — fast laws over the real lease machinery.
@@ -78,30 +84,12 @@ object LocalTckHarness:
           OperationRegistry
             .from[IO](
               Vector(
-                OperationRegistry.entry(
-                  echo,
-                  TckWire.stringInput,
-                  TckWire.stringResult,
-                  RetrySafety.SafeForAutomaticRetry
-                )(input => IO.pure(s"echo:$input")),
-                OperationRegistry.entry(
-                  failing,
-                  TckWire.stringInput,
-                  TckWire.stringResult,
-                  RetrySafety.Unknown
-                )(_ => IO.raiseError(new RuntimeException("deliberate failure"))),
-                OperationRegistry.entry(
-                  sleepy,
-                  TckWire.stringInput,
-                  TckWire.stringResult,
-                  RetrySafety.Unknown
-                )(input => IO.sleep(30.seconds).as(input)),
-                OperationRegistry.entry(
-                  counting,
-                  TckWire.stringInput,
-                  TckWire.stringResult,
-                  RetrySafety.SafeForAutomaticRetry
-                )(input => executed.update(_ + 1L).as(input))
+                OperationRegistry.entry(echo)(input => IO.pure(s"echo:$input")),
+                OperationRegistry.entry(failing)(_ =>
+                  IO.raiseError(new RuntimeException("deliberate failure"))
+                ),
+                OperationRegistry.entry(sleepy)(input => IO.sleep(30.seconds).as(input)),
+                OperationRegistry.entry(counting)(input => executed.update(_ + 1L).as(input))
               )
             )
             .left

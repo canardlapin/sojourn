@@ -13,6 +13,8 @@ object Dependencies {
   }
 
   object Libraries {
+    val remoteExecKernel =
+      "io.github.bbuchsbaum" %% "remote-exec-kernel" % Versions.scalaSlurm
     val scalaSlurmCore = "io.github.bbuchsbaum" %% "scala-slurm-core" % Versions.scalaSlurm
     val scalaSlurmProtocol =
       "io.github.bbuchsbaum" %% "scala-slurm-protocol" % Versions.scalaSlurm
@@ -20,6 +22,7 @@ object Dependencies {
     val scalaSlurmManaged =
       "io.github.bbuchsbaum" %% "scala-slurm-managed" % Versions.scalaSlurm
     val scalaSlurmLocal = "io.github.bbuchsbaum" %% "scala-slurm-local" % Versions.scalaSlurm
+    val scalaSlurmSsh = "io.github.bbuchsbaum" %% "scala-slurm-ssh" % Versions.scalaSlurm
     val catsEffect = "org.typelevel" %% "cats-effect" % Versions.catsEffect
     val catsEffectTestkit = "org.typelevel" %% "cats-effect-testkit" % Versions.catsEffect
     val fs2Core = "co.fs2" %% "fs2-core" % Versions.fs2

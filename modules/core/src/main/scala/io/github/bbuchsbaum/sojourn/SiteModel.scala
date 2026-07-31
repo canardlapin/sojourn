@@ -1,14 +1,21 @@
 package io.github.bbuchsbaum.sojourn
 
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
-import io.github.bbuchsbaum.scalaslurm.core.OperationId
-import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
-import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
-import io.github.bbuchsbaum.scalaslurm.core.ResultSchemaId
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
-import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.remoteexec.kernel.DurationMillis
+import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
+import io.github.bbuchsbaum.remoteexec.kernel.OperationId
+import io.github.bbuchsbaum.remoteexec.kernel.OperationRef
+import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
+import io.github.bbuchsbaum.remoteexec.kernel.PositiveInt
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
+import io.github.bbuchsbaum.remoteexec.kernel.ResultSchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
+import io.github.bbuchsbaum.remoteexec.kernel.WallTimeMinutes
+
+type OperationDescriptor = io.github.bbuchsbaum.remoteexec.kernel.OperationDescriptor
+val OperationDescriptor = io.github.bbuchsbaum.remoteexec.kernel.OperationDescriptor
 
 /** Shared lexical rules for site tokens. A site token is a lowercase, filesystem-safe atom used for
   * site names and pilot identifiers: it must survive being embedded verbatim in a path segment.
@@ -116,26 +123,60 @@ final case class RemoteRef[+A](
     schema: SchemaId
 ) derives CanEqual
 
-/** A typed handle to a registered operation. `I` and `O` are phantom tags; the wire identity is the
-  * operation id, version, and the input/result schema ids.
+/** A typed submitting view derived from one executable registration.
+  *
+  * The portable identity is stored once in [[OperationRef]]. Codecs and retry safety travel with
+  * the typed handle, so a caller never needs an erased registry lookup to encode its input.
   */
-final case class SiteOperation[I, O](
-    id: OperationId,
-    version: OperationVersion,
-    inputSchema: SchemaId,
-    resultSchema: ResultSchemaId
+final case class SiteOperation[I, O] private (
+    reference: OperationRef[I, O],
+    input: InputCodec[I],
+    result: ResultCodec[O],
+    retrySafety: RetrySafety,
+    artifacts: ArtifactDeclarations
 ) derives CanEqual:
-  /** The untyped wire identity of this operation. */
-  def descriptor: OperationDescriptor =
-    OperationDescriptor(id, version, inputSchema, resultSchema)
+  def descriptor: OperationDescriptor = reference.descriptor
+  def id: OperationId = descriptor.id
+  def version: OperationVersion = descriptor.version
+  def inputSchema: SchemaId = descriptor.inputSchema
+  def resultSchema: ResultSchemaId = descriptor.outputSchema
+  def withRetrySafety(value: RetrySafety): SiteOperation[I, O] =
+    copy(retrySafety = value)
+  def withArtifacts(value: ArtifactDeclarations): SiteOperation[I, O] =
+    copy(artifacts = value)
 
-/** The untyped wire identity of one registered operation: id, version, and schema pair. */
-final case class OperationDescriptor(
-    id: OperationId,
-    version: OperationVersion,
-    inputSchema: SchemaId,
-    resultSchema: ResultSchemaId
-) derives CanEqual
+object SiteOperation:
+  def apply[I, O](
+      id: OperationId,
+      version: OperationVersion,
+      input: InputCodec[I],
+      result: ResultCodec[O],
+      retrySafety: RetrySafety = RetrySafety.Unknown,
+      artifacts: ArtifactDeclarations = ArtifactDeclarations.empty
+  ): SiteOperation[I, O] =
+    SiteOperation(
+      OperationRef(id, version, input.schemaId, result.schemaId),
+      input,
+      result,
+      retrySafety,
+      artifacts
+    )
+
+  def fromDescriptor[I, O](
+      descriptor: OperationDescriptor,
+      input: InputCodec[I],
+      result: ResultCodec[O],
+      retrySafety: RetrySafety,
+      artifacts: ArtifactDeclarations = ArtifactDeclarations.empty
+  ): Either[ValidationFailure, SiteOperation[I, O]] =
+    Either.cond(
+      descriptor.inputSchema == input.schemaId && descriptor.outputSchema == result.schemaId,
+      SiteOperation(OperationRef(descriptor), input, result, retrySafety, artifacts),
+      ValidationFailure(
+        "siteOperation",
+        "operation descriptor schemas do not match the supplied codecs"
+      )
+    )
 
 /** The set of operations a site can execute — the registry handshake made data.
   *
@@ -149,7 +190,8 @@ final case class OperationCatalog private (
   def contains(descriptor: OperationDescriptor): Boolean =
     entries.get((descriptor.id, descriptor.version)).contains(descriptor)
 
-  def descriptors: Vector[OperationDescriptor] = entries.values.toVector
+  def descriptors: Vector[OperationDescriptor] =
+    entries.values.toVector.sortBy(value => value.id.value -> value.version.value)
 
 object OperationCatalog:
   val empty: OperationCatalog = OperationCatalog(Map.empty)

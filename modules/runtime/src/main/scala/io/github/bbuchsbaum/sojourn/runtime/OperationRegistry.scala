@@ -2,13 +2,16 @@ package io.github.bbuchsbaum.sojourn.runtime
 
 import cats.effect.kernel.Sync
 import cats.syntax.all.*
-import io.github.bbuchsbaum.scalaslurm.core.InputCodec
-import io.github.bbuchsbaum.scalaslurm.core.OperationId
-import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodec
-import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
+import io.github.bbuchsbaum.remoteexec.kernel.OperationId
+import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
+import io.github.bbuchsbaum.sojourn.ArtifactOutput
+import io.github.bbuchsbaum.sojourn.ArtifactPath
+import io.github.bbuchsbaum.sojourn.ArtifactReceipt
+import io.github.bbuchsbaum.sojourn.ArtifactWriteFailure
+import io.github.bbuchsbaum.sojourn.ArtifactDeclarations
 import io.github.bbuchsbaum.sojourn.OperationCatalog
+import io.github.bbuchsbaum.sojourn.OperationContext
 import io.github.bbuchsbaum.sojourn.OperationDescriptor
 import io.github.bbuchsbaum.sojourn.SiteOperation
 
@@ -23,20 +26,19 @@ enum OperationRunFailure derives CanEqual:
   /** The produced value did not encode against the operation's result schema. */
   case InvalidResult(detail: String)
 
-/** One executable operation: its wire identity, declared retry safety, a byte-level runner, and an
-  * erased input encoder. The byte-level forms are what dispatchers and pilots invoke; the typed
-  * constructor lives on [[OperationRegistry.entry]].
+/** One executable operation lowered to its portable descriptor and byte-level runner.
   *
-  * `encodeInput` is the registry's single erased-application point: a submit call holds a value
-  * whose static type matched a `SiteOperation[I, O]` with this descriptor, and descriptor equality
-  * pins the wire schemas, so applying the registered `InputCodec[I]` to it is wire-sound; the
-  * phantom-level cast lives inside this one audited closure and nowhere else.
+  * Typed input encoding happens through [[SiteOperation.input]] before lookup, so this erased
+  * execution view needs neither a cast nor an unchecked pattern.
   */
 final case class RegisteredOperation[F[_]] private[runtime] (
     descriptor: OperationDescriptor,
-    retrySafety: RetrySafety,
+    artifacts: ArtifactDeclarations,
     run: Vector[Byte] => F[Either[OperationRunFailure, Vector[Byte]]],
-    encodeInput: Any => Either[OperationRunFailure, Vector[Byte]]
+    runWithContext: (
+        Vector[Byte],
+        OperationContext[F]
+    ) => F[Either[OperationRunFailure, Vector[Byte]]]
 )
 
 /** The executable side of an [[OperationCatalog]]: descriptors plus their runners.
@@ -48,27 +50,14 @@ final case class RegisteredOperation[F[_]] private[runtime] (
 final class OperationRegistry[F[_]] private (
     val catalog: OperationCatalog,
     handlers: Map[(OperationId, OperationVersion), RegisteredOperation[F]],
-    typed: Map[(OperationId, OperationVersion), OperationRegistry.Entry[F, ?, ?]]
+    val entries: Vector[OperationRegistry.Entry[F, ?, ?]]
 ):
   def lookup(descriptor: OperationDescriptor): Option[RegisteredOperation[F]] =
     handlers.get((descriptor.id, descriptor.version)).filter(_.descriptor == descriptor)
 
-  /** All typed entries, for bridges that reconstruct per-entry typed views (worker registries). */
-  def entries: Vector[OperationRegistry.Entry[F, ?, ?]] = typed.values.toVector
-
-  /** The typed entry registered for `op`, if its full descriptor matches.
-    *
-    * This is the registry's other audited erasure point (the first is
-    * [[RegisteredOperation.encodeInput]]): the entry was registered under a `SiteOperation[I', O']`
-    * whose descriptor equals `op.descriptor`, so both sides agree on the wire schemas; the
-    * phantom-level refinement `?, ?` → `I, O` is sound at the byte level and confined to this
-    * method.
-    */
-  def typedEntry[I, O](op: SiteOperation[I, O]): Option[OperationRegistry.Entry[F, I, O]] =
-    typed
-      .get((op.id, op.version))
-      .filter(_.operation.descriptor == op.descriptor)
-      .map(_.asInstanceOf[OperationRegistry.Entry[F, I, O]])
+  /** Lookup for submission paths, which must agree on both portable identity and declared files. */
+  def lookup(operation: SiteOperation[?, ?]): Option[RegisteredOperation[F]] =
+    lookup(operation.descriptor).filter(_.artifacts == operation.artifacts)
 
 object OperationRegistry:
   /** A typed registry entry. `run` may raise in `F`; the registry converts raised errors into
@@ -76,19 +65,16 @@ object OperationRegistry:
     */
   final case class Entry[F[_], I, O](
       operation: SiteOperation[I, O],
-      input: InputCodec[I],
-      result: ResultCodec[O],
-      retrySafety: RetrySafety,
-      run: I => F[O]
+      run: (I, OperationContext[F]) => F[O]
   )
 
-  def entry[F[_], I, O](
-      operation: SiteOperation[I, O],
-      input: InputCodec[I],
-      result: ResultCodec[O],
-      retrySafety: RetrySafety
-  )(run: I => F[O]): Entry[F, I, O] =
-    Entry(operation, input, result, retrySafety, run)
+  def entry[F[_], I, O](operation: SiteOperation[I, O])(run: I => F[O]): Entry[F, I, O] =
+    Entry(operation, (input, _) => run(input))
+
+  def entryWithContext[F[_], I, O](
+      operation: SiteOperation[I, O]
+  )(run: (I, OperationContext[F]) => F[O]): Entry[F, I, O] =
+    Entry(operation, run)
 
   def from[F[_]: Sync](
       entries: Vector[Entry[F, ?, ?]]
@@ -116,24 +102,24 @@ object OperationRegistry:
           else Right(handlers.updated(key, lower(descriptor, entry)))
         }
       }
-      typed = entries.map(entry => (entry.operation.id, entry.operation.version) -> entry).toMap
-    yield new OperationRegistry(catalog, handlers, typed)
+      ordered = entries.sortBy(entry => entry.operation.id.value -> entry.operation.version.value)
+    yield new OperationRegistry(catalog, handlers, ordered)
 
   private def lower[F[_]: Sync, I, O](
       descriptor: OperationDescriptor,
       entry: Entry[F, I, O]
   ): RegisteredOperation[F] =
-    RegisteredOperation(
-      descriptor,
-      entry.retrySafety,
-      run = inputBytes =>
-        entry.input.decode(inputBytes) match
+    val contextual: (Vector[Byte], OperationContext[F]) => F[
+      Either[OperationRunFailure, Vector[Byte]]
+    ] =
+      (inputBytes, context) =>
+        entry.operation.input.decode(inputBytes) match
           case Left(failure) =>
             Sync[F].pure(
               Left(OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}"))
             )
           case Right(input) =>
-            entry.run(input).attempt.map {
+            entry.run(input, context).attempt.map {
               case Left(error) =>
                 Left(
                   OperationRunFailure.Execution(
@@ -142,17 +128,39 @@ object OperationRegistry:
                   )
                 )
               case Right(value) =>
-                entry.result.encode(value) match
+                entry.operation.result.encode(value) match
                   case Left(failure) =>
                     Left(
                       OperationRunFailure.InvalidResult(s"${failure.code}: ${failure.message}")
                     )
                   case Right(bytes) => Right(bytes)
-            },
-      encodeInput = value =>
-        // The registry's single erased application; see the field's documentation.
-        entry.input
-          .encode(value.asInstanceOf[I])
-          .left
-          .map(failure => OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}"))
+            }
+    val unavailable = new ArtifactOutput[F]:
+      def write(
+          path: ArtifactPath,
+          bytes: fs2.Stream[F, Byte]
+      ): F[Either[ArtifactWriteFailure, ArtifactReceipt]] =
+        Sync[F].pure(
+          Left(
+            ArtifactWriteFailure.Unavailable(
+              path,
+              "this execution surface does not transport declared artifacts"
+            )
+          )
+        )
+    RegisteredOperation(
+      descriptor,
+      entry.operation.artifacts,
+      run = inputBytes =>
+        if entry.operation.artifacts.nonEmpty then
+          Sync[F].pure(
+            Left(
+              OperationRunFailure.Execution(
+                "artifact-output-unsupported",
+                "this execution surface does not transport declared artifacts"
+              )
+            )
+          )
+        else contextual(inputBytes, OperationContext(unavailable)),
+      runWithContext = contextual
     )

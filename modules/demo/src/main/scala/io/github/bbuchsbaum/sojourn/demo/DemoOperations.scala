@@ -1,10 +1,10 @@
 package io.github.bbuchsbaum.sojourn.demo
 
 import cats.effect.IO
-import io.github.bbuchsbaum.scalaslurm.core.OperationId
-import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
-import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
+import io.github.bbuchsbaum.remoteexec.kernel.OperationId
+import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
+import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 import io.github.bbuchsbaum.sojourn.SiteOperation
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
 import io.github.bbuchsbaum.sojourn.tck.TckWire
@@ -23,18 +23,24 @@ import scala.concurrent.duration.*
   * serves both execution shapes.
   */
 object DemoOperations:
-  private def operation(name: String): SiteOperation[String, String] =
+  private def operation(
+      name: String,
+      retrySafety: RetrySafety
+  ): SiteOperation[String, String] =
     SiteOperation(
       OperationId.from(s"sojourn.tck.$name").toOption.get,
       OperationVersion.from("1").toOption.get,
-      TckWire.stringInputSchema,
-      TckWire.stringResultSchema
+      TckWire.stringInput,
+      TckWire.stringResult,
+      retrySafety
     )
 
-  val echo: SiteOperation[String, String] = operation("echo")
-  val failing: SiteOperation[String, String] = operation("failing")
-  val sleepy: SiteOperation[String, String] = operation("sleepy")
-  val counting: SiteOperation[String, String] = operation("counting")
+  val echo: SiteOperation[String, String] =
+    operation("echo", RetrySafety.SafeForAutomaticRetry)
+  val failing: SiteOperation[String, String] = operation("failing", RetrySafety.Unknown)
+  val sleepy: SiteOperation[String, String] = operation("sleepy", RetrySafety.Unknown)
+  val counting: SiteOperation[String, String] =
+    operation("counting", RetrySafety.SafeForAutomaticRetry)
 
   /** The registry both the submitting side and the worker binary build — one definition, every
     * execution shape.
@@ -42,30 +48,12 @@ object DemoOperations:
   def registry(countDirectory: Option[Path]): Either[ValidationFailure, OperationRegistry[IO]] =
     OperationRegistry.from[IO](
       Vector(
-        OperationRegistry.entry(
-          echo,
-          TckWire.stringInput,
-          TckWire.stringResult,
-          RetrySafety.SafeForAutomaticRetry
-        )(input => IO.pure(s"echo:$input")),
-        OperationRegistry.entry(
-          failing,
-          TckWire.stringInput,
-          TckWire.stringResult,
-          RetrySafety.Unknown
-        )(_ => IO.raiseError(new RuntimeException("deliberate failure"))),
-        OperationRegistry.entry(
-          sleepy,
-          TckWire.stringInput,
-          TckWire.stringResult,
-          RetrySafety.Unknown
-        )(input => IO.sleep(30.seconds).as(input)),
-        OperationRegistry.entry(
-          counting,
-          TckWire.stringInput,
-          TckWire.stringResult,
-          RetrySafety.SafeForAutomaticRetry
-        )(input => recordExecution(countDirectory).as(input))
+        OperationRegistry.entry(echo)(input => IO.pure(s"echo:$input")),
+        OperationRegistry.entry(failing)(_ =>
+          IO.raiseError(new RuntimeException("deliberate failure"))
+        ),
+        OperationRegistry.entry(sleepy)(input => IO.sleep(30.seconds).as(input)),
+        OperationRegistry.entry(counting)(input => recordExecution(countDirectory).as(input))
       )
     )
 

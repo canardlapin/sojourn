@@ -10,6 +10,7 @@ import io.github.bbuchsbaum.scalaslurm.core.ResourceRequest
 import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
 import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
 import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
+import io.github.bbuchsbaum.scalaslurm.ssh.SlurmSshConfig
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.local.LocalSite
 import io.github.bbuchsbaum.sojourn.local.LocalSiteConfig
@@ -57,12 +58,19 @@ final class SimpleHandle[O] private[dsl] (
     */
   def value: IO[O] =
     underlying.await.flatMap {
-      case TaskOutcome.Succeeded(ref) =>
+      case TaskOutcome.Succeeded(ref, _) =>
         fetch(ref).flatMap {
           case Right(result) => IO.pure(result)
           case Left(failure) => IO.raiseError(ResultUnavailable(failure))
         }
       case other => IO.raiseError(TaskDidNotSucceed(other))
+    }
+
+  /** Await successful durable publication and return its complete declared artifact set. */
+  def artifacts: IO[ArtifactSet] =
+    underlying.await.flatMap {
+      case TaskOutcome.Succeeded(_, artifacts) => IO.pure(artifacts)
+      case other                               => IO.raiseError(TaskDidNotSucceed(other))
     }
 
   def status: IO[TaskStatus] = underlying.status
@@ -85,7 +93,7 @@ final class SimpleRunner private[dsl] (
   def submit[I, O](op: Op[I, O], input: I, key: SubmissionKey): IO[SimpleHandle[O]] =
     runner.submit(op.operation, TaskInput.Inline(input), key).flatMap {
       case Right(handle) =>
-        IO.pure(SimpleHandle(handle, ref => store.fetch(ref, op.wireOut.result)))
+        IO.pure(SimpleHandle(handle, ref => store.fetch(ref, op.operation.result)))
       case Left(rejection) => IO.raiseError(SubmitRefused(rejection))
     }
 
@@ -93,7 +101,7 @@ final class SimpleRunner private[dsl] (
   def submitStored[I, O](op: Op[I, O], ref: RemoteRef[I], key: SubmissionKey): IO[SimpleHandle[O]] =
     runner.submit(op.operation, TaskInput.Stored(ref), key).flatMap {
       case Right(handle) =>
-        IO.pure(SimpleHandle(handle, out => store.fetch(out, op.wireOut.result)))
+        IO.pure(SimpleHandle(handle, out => store.fetch(out, op.operation.result)))
       case Left(rejection) => IO.raiseError(SubmitRefused(rejection))
     }
 
@@ -219,6 +227,27 @@ object Sojourn:
       defaults <- Resource.eval(defaultResources(resources))
       backend <- SlurmSite.local(
         SlurmSiteConfig(site, workspace, workerExecutable, release, defaults),
+        registry
+      )
+    yield SimpleSite(backend)
+
+  /** The same Slurm site semantics over scala-slurm's negotiated OpenSSH agent transport. */
+  def slurmSsh(
+      name: String,
+      workspace: Path,
+      workerExecutable: Path,
+      release: WorkerRelease,
+      ssh: SlurmSshConfig,
+      ops: Seq[Op[?, ?]],
+      resources: Option[ResourceRequest] = None
+  ): Resource[IO, SimpleSite] =
+    for
+      site <- Resource.eval(parseSiteName(name))
+      registry <- Resource.eval(registryOf(ops))
+      defaults <- Resource.eval(defaultResources(resources))
+      backend <- SlurmSite.overSsh(
+        SlurmSiteConfig(site, workspace, workerExecutable, release, defaults),
+        ssh,
         registry
       )
     yield SimpleSite(backend)

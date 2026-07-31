@@ -19,11 +19,13 @@ object Quickstart extends IOApp.Simple:
   }
 ```
 
-Swap `Sojourn.local` for `Sojourn.slurm(...)` and the same code runs each task
+Swap `Sojourn.local` for `Sojourn.slurm(...)` (local Slurm CLI) or
+`Sojourn.slurmSsh(...)` (negotiated SSH agent) and the same code runs each task
 as a scheduler job on a cluster. `site.run` is a documented convenience that
 collapses the total outcome into a typed exception carrying full evidence; the
-honest surface — `submit`/`outcome` with `Succeeded | Failed | Interrupted |
-Unknown`, keyed idempotent resubmission, `RemoteRef` reference-passing, leased
+honest surface — `submit`/`outcome` with `Succeeded | PublicationFailed | Failed
+| Interrupted | Unknown`, keyed idempotent resubmission, `RemoteRef`
+reference-passing, durable declared file artifacts, leased
 pools with `awaitGranted` — is one method away, and `site.raw` exposes the
 entire SPI. Operations default to at-most-once (`RetrySafety.Unknown`);
 `.retrySafe` is an explicit opt-in to automatic requeue.
@@ -45,25 +47,29 @@ milestone).
 Design: `docs/architecture/0001-site-layer.md` (site layer) and
 `docs/architecture/0002-spool-runtime.md` (spool runtime semantics: the reclaim
 evidence ladder, epoch fence, clock-free heartbeat staleness, drain, and lease
-machine). Program plan: `docs/plans/2026-07-24-remote-executor.md`.
+machine). `docs/architecture/0004-compositional-slurm.md` records the exact
+Sojourn/scala-slurm ownership boundary and local/SSH capability assembly.
+`docs/architecture/0005-durable-artifacts.md` defines file-producing operation,
+promotion, and pipeline-composition semantics.
+Program plan: `docs/plans/2026-07-24-remote-executor.md`.
 
 ## Modules
 
 | Module | Boundary |
 | --- | --- |
-| `sojourn-core` | Pure SPI (`Site`, `SiteStore`, `TaskRunner`, `LeasedPool`, `LeaseState`, total `TaskOutcome`), validated identifiers, spool wire protocol v1 with canonical codecs + golden fixtures |
-| `sojourn-runtime` | Scheduler-neutral effectful machinery: content-addressed shared-FS store, operation registry, site preflight probes, the one worker binary (one-shot + pilot modes), pilot loop, pool dispatcher (reclaim ladder, epoch fence, lease governance) |
+| `sojourn-core` | Pure SPI (`Site`, `SiteStore`, `TaskRunner`, `LeasedPool`, `LeaseState`, total `TaskOutcome`), durable artifact contracts, validated identifiers, spool wire protocol v1 with canonical codecs + golden fixtures |
+| `sojourn-runtime` | Scheduler-neutral effectful machinery: content-addressed shared-FS store and complete artifact-set promotion, operation registry, site preflight probes, the one worker binary (one-shot + pilot modes), pilot loop, pool dispatcher (reclaim ladder, epoch fence, lease governance) |
 | `sojourn-local` | Scheduler-free backend: batch on supervised fibers, pool as in-process pilots over a real filesystem spool — the neutrality proof and dev-mode |
-| `sojourn-slurm` | The exemplary Slurm backend: durable managed submission, typed staging, strict digest-verified result attachment over a shared workspace |
-| `sojourn-dsl` | The ergonomics layer: `Wire[A]` givens (schema + codecs from one definition), `Op`, compile-time-checked identifier literals, `Sojourn.local`/`slurm` facades, `run`/`value` conveniences over the total outcome |
+| `sojourn-slurm` | The exemplary Slurm backend: one managed executor assembled over local CLI or SSH, typed staging, durable control, and strict digest-verified result attachment |
+| `sojourn-dsl` | The ergonomics layer: `Wire[A]` givens, `Op`, compile-time-checked identifier literals, `Sojourn.local`/`slurm`/`slurmSsh` facades, and `run`/`value` conveniences over the total outcome |
 | `sojourn-tck` | Published conformance suites (`StoreTck`, `BatchTck`, `PoolTck`, `ParityTck`) any backend instantiates over a `TckHarness` |
 | `sojourn-demo` | Unpublished demo operations + the assembled worker binary used by tests and acceptance |
 
-Known coupling: sojourn borrows scala-slurm-core's identifier/evidence
-vocabulary (`SubmissionKey`, `ContentDigest`, `Freshness`, `Diagnostics`, …) and
-scala-slurm-worker's `AtomicFiles` kernel. Both are pure data / scheduler-free —
-no scheduler runtime crosses the boundary — but true provider-neutrality would
-require extracting that vocabulary; recorded as a pre-1.0 phase.
+Provider-neutral contracts and atomic filesystem mechanics come from
+`remote-exec-kernel`; both Sojourn and scala-slurm depend downward on that
+artifact. `sojourn-core` has no scala-slurm dependency. The ownership rule is
+recorded in `docs/architecture/0003-provider-neutral-kernel.md`; the remaining
+composition boundary is recorded in `docs/architecture/0004-compositional-slurm.md`.
 
 ## Build
 

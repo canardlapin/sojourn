@@ -1,17 +1,17 @@
 package io.github.bbuchsbaum.sojourn
 
 import cats.effect.Resource
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostics
-import io.github.bbuchsbaum.scalaslurm.core.FailureDiagnosis
-import io.github.bbuchsbaum.scalaslurm.core.Freshness
-import io.github.bbuchsbaum.scalaslurm.core.InputCodec
-import io.github.bbuchsbaum.scalaslurm.core.OperationId
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodec
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodecFailure
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostics
+import io.github.bbuchsbaum.remoteexec.kernel.FailureDiagnosis
+import io.github.bbuchsbaum.remoteexec.kernel.Freshness
+import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
+import io.github.bbuchsbaum.remoteexec.kernel.OperationId
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodecFailure
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 
 /** Coarse lifecycle phase of a task as last observed. */
 enum TaskPhase derives CanEqual:
@@ -25,7 +25,9 @@ final case class TaskStatus(phase: TaskPhase, freshness: Freshness) derives CanE
 
 /** The terminal outcome of a task, reported as data.
   *
-  *   - [[Succeeded]]: the result is available as a `RemoteRef[O]` in the site store.
+  *   - [[Succeeded]]: the result and complete declared artifact set are durable in the site store.
+  *   - [[PublicationFailed]]: workload execution succeeded, but its declared files could not be
+  *     promoted as one verified durable artifact set.
   *   - [[Failed]]: the task ran and failed; `report` is the evidence-ranked diagnosis.
   *   - [[Interrupted]]: the task was stopped by scheduler policy or infrastructure (preemption,
   *     node loss, cancellation); `diagnostics` carries the observed evidence.
@@ -35,7 +37,12 @@ final case class TaskStatus(phase: TaskPhase, freshness: Freshness) derives CanE
   *     genuinely indeterminate, not as failure or success.
   */
 enum TaskOutcome[+O] derives CanEqual:
-  case Succeeded(ref: RemoteRef[O])
+  case Succeeded(ref: RemoteRef[O], artifacts: ArtifactSet = ArtifactSet.empty)
+  case PublicationFailed(
+      ref: RemoteRef[O],
+      failure: ArtifactPublicationFailure,
+      diagnostics: Diagnostics
+  )
   case Failed(report: FailureDiagnosis)
   case Interrupted(diagnostics: Diagnostics)
   case Unknown(diagnostics: Diagnostics)

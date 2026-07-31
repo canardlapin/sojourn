@@ -1,8 +1,8 @@
 package io.github.bbuchsbaum.sojourn.tck
 
 import cats.effect.IO
-import io.github.bbuchsbaum.scalaslurm.core.OperationId
-import io.github.bbuchsbaum.scalaslurm.core.OperationVersion
+import io.github.bbuchsbaum.remoteexec.kernel.OperationId
+import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
 import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.RemoteRef
 import io.github.bbuchsbaum.sojourn.Site
@@ -44,6 +44,6 @@ object TckHarness:
     SiteOperation(
       OperationId.from("sojourn.tck.unregistered").toOption.get,
       OperationVersion.from("1").toOption.get,
-      TckWire.stringInputSchema,
-      TckWire.stringResultSchema
+      TckWire.stringInput,
+      TckWire.stringResult
     )

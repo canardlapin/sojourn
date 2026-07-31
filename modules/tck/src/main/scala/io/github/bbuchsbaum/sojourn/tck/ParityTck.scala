@@ -2,7 +2,7 @@ package io.github.bbuchsbaum.sojourn.tck
 
 import cats.effect.IO
 import cats.effect.Resource
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.sojourn.TaskInput
 import io.github.bbuchsbaum.sojourn.TaskOutcome
 import munit.CatsEffectSuite
@@ -48,7 +48,10 @@ abstract class ParityTck extends CatsEffectSuite:
         .map(_.toOption.get)
         .flatMap(_.await)
     yield (viaBatch, viaPool) match
-      case (TaskOutcome.Succeeded(batchRef), TaskOutcome.Succeeded(poolRef)) =>
+      case (
+            TaskOutcome.Succeeded(batchRef, _),
+            TaskOutcome.Succeeded(poolRef, _)
+          ) =>
         assertEquals(batchRef.digest, poolRef.digest)
         assertEquals(batchRef.path, poolRef.path) // content-addressed: same bytes, same address
       case other => fail(s"expected two Succeeded outcomes, observed $other")

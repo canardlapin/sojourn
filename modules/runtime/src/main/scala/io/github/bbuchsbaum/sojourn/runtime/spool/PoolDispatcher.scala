@@ -7,25 +7,24 @@ import cats.effect.kernel.Resource
 import cats.syntax.all.*
 import fs2.Stream
 import fs2.concurrent.Topic
-import io.github.bbuchsbaum.scalaslurm.core.AttemptEpoch
-import io.github.bbuchsbaum.scalaslurm.core.AttemptId
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostics
-import io.github.bbuchsbaum.scalaslurm.core.FailureCause
-import io.github.bbuchsbaum.scalaslurm.core.FailureDiagnosis
-import io.github.bbuchsbaum.scalaslurm.core.Freshness
-import io.github.bbuchsbaum.scalaslurm.core.RetrySafety
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostics
+import io.github.bbuchsbaum.remoteexec.kernel.FailureCause
+import io.github.bbuchsbaum.remoteexec.kernel.FailureDiagnosis
+import io.github.bbuchsbaum.remoteexec.kernel.Freshness
+import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.runtime.KeyToken
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
 import io.github.bbuchsbaum.sojourn.runtime.OperationRunFailure
-import io.github.bbuchsbaum.sojourn.runtime.RegisteredOperation
 import io.github.bbuchsbaum.sojourn.spool.PilotHeartbeat
 import io.github.bbuchsbaum.sojourn.spool.PilotId
 import io.github.bbuchsbaum.sojourn.spool.PilotRegistration
@@ -246,35 +245,50 @@ object PoolDispatcher:
         input: TaskInput[I],
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-      registry.lookup(op.descriptor) match
-        case None             => IO.pure(Left(SubmitRejection.UnknownOperation(op.id)))
-        case Some(registered) =>
-          prepare(registered, input) match
-            case Left(failure) =>
-              IO.pure(
-                Left(
-                  SubmitRejection.InvalidInput(
-                    ValidationFailure("input", describeRunFailure(failure))
+      if op.artifacts.nonEmpty then
+        IO.pure(
+          Left(
+            SubmitRejection.InvalidInput(
+              ValidationFailure(
+                "artifacts",
+                "pilot pools do not yet transport declared artifacts; use the site batch runner"
+              )
+            )
+          )
+        )
+      else
+        registry.lookup(op) match
+          case None    => IO.pure(Left(SubmitRejection.UnknownOperation(op.id)))
+          case Some(_) =>
+            prepare(op, input) match
+              case Left(failure) =>
+                IO.pure(
+                  Left(
+                    SubmitRejection.InvalidInput(
+                      ValidationFailure("input", describeRunFailure(failure))
+                    )
                   )
                 )
-              )
-            case Right(prepared) => admit(op, registered, prepared, key)
+              case Right(prepared) => admit(op, prepared, key)
 
     private def prepare[I](
-        registered: RegisteredOperation[IO],
+        op: SiteOperation[I, ?],
         input: TaskInput[I]
     ): Either[OperationRunFailure, PreparedInput] =
       input match
         case TaskInput.Inline(value) =>
-          registered
-            .encodeInput(value)
+          op.input
+            .encode(value)
+            .left
+            .map(failure =>
+              OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}")
+            )
             .map(bytes => PreparedInput.Carried(bytes, AtomicFiles.digestOf(bytes)))
         case TaskInput.Stored(ref) =>
           Right(PreparedInput.Referenced(ref.path, ref.digest))
 
     private def admit[I, O](
         op: SiteOperation[I, O],
-        registered: RegisteredOperation[IO],
         prepared: PreparedInput,
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
@@ -289,13 +303,12 @@ object PoolDispatcher:
                 if existing.descriptor == op.descriptor && existing.inputIdentity == identity =>
               IO.pure(Right(taskHandle[O](existing)))
             case Some(_) => IO.pure(Left(SubmitRejection.Conflict(key)))
-            case None    => create(op, registered, prepared, identity, key)
+            case None    => create(op, prepared, identity, key)
           }
       }
 
     private def create[I, O](
         op: SiteOperation[I, O],
-        registered: RegisteredOperation[IO],
         prepared: PreparedInput,
         identity: ContentDigest,
         key: SubmissionKey
@@ -346,7 +359,7 @@ object PoolDispatcher:
                       case true =>
                         state.tasks.update(_ - key).as(Left(SubmitRejection.Closed))
                       case false =>
-                        stageAndPublish(op, registered, prepared, minted, submittedAt, task)
+                        stageAndPublish(op, prepared, minted, submittedAt, task)
                           .as(Right(taskHandle[O](task)))
                     }
                   else IO.pure(Right(taskHandle[O](task)))
@@ -359,7 +372,6 @@ object PoolDispatcher:
       */
     private def stageAndPublish[I, O](
         op: SiteOperation[I, O],
-        registered: RegisteredOperation[IO],
         prepared: PreparedInput,
         attemptId: AttemptId,
         submittedAt: Instant,
@@ -383,7 +395,7 @@ object PoolDispatcher:
             op.version,
             op.inputSchema,
             op.resultSchema,
-            registered.retrySafety,
+            op.retrySafety,
             config.manifest.limits,
             submittedAt,
             spoolInput

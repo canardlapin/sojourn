@@ -1,7 +1,7 @@
 package io.github.bbuchsbaum.sojourn.runtime
 
 import cats.effect.kernel.Sync
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
 
 import java.nio.file.Files as JFiles
 import java.nio.file.Path

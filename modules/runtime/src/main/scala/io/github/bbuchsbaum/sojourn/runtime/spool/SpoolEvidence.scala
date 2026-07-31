@@ -1,6 +1,6 @@
 package io.github.bbuchsbaum.sojourn.runtime.spool
 
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
 import io.github.bbuchsbaum.sojourn.StoreFailure
 
 /** Canonical renderings of the shared failure vocabularies used in spool diagnostics — hoisted so

@@ -21,6 +21,7 @@ import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
 import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
 import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
 import io.github.bbuchsbaum.sojourn.*
+import io.github.bbuchsbaum.sojourn.runtime.ArtifactPublisher
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
 import io.github.bbuchsbaum.sojourn.runtime.OperationRunFailure
@@ -101,6 +102,7 @@ object LocalSite:
   final private case class LocalTask(
       descriptor: OperationDescriptor,
       inputIdentity: ContentDigest,
+      artifacts: ArtifactDeclarations,
       phase: Ref[IO, TaskPhase],
       outcome: Deferred[IO, TaskOutcome[Nothing]],
       cancelRequested: Deferred[IO, Unit]
@@ -280,10 +282,10 @@ object LocalSite:
           input: TaskInput[I],
           key: SubmissionKey
       ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-        registry.lookup(op.descriptor) match
+        registry.lookup(op) match
           case None             => IO.pure(Left(SubmitRejection.UnknownOperation(op.id)))
           case Some(registered) =>
-            prepareInput(registered, input) match
+            prepareInput(op, input) match
               case Left(failure) =>
                 IO.pure(
                   Left(
@@ -302,13 +304,17 @@ object LocalSite:
       case Referenced(path: SitePath, identity: ContentDigest)
 
     private def prepareInput[I](
-        registered: RegisteredOperation[IO],
+        operation: SiteOperation[I, ?],
         input: TaskInput[I]
     ): Either[OperationRunFailure, PreparedInput] =
       input match
         case TaskInput.Inline(value) =>
-          registered
-            .encodeInput(value)
+          operation.input
+            .encode(value)
+            .left
+            .map(failure =>
+              OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}")
+            )
             .map(bytes => PreparedInput.Carried(bytes, AtomicFiles.digestOf(bytes)))
         case TaskInput.Stored(ref) =>
           Right(PreparedInput.Referenced(ref.path, ref.digest))
@@ -327,14 +333,17 @@ object LocalSite:
         phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
         outcome <- Deferred[IO, TaskOutcome[Nothing]]
         cancelRequested <- Deferred[IO, Unit]
-        candidate = LocalTask(op.descriptor, identity, phase, outcome, cancelRequested)
+        candidate =
+          LocalTask(op.descriptor, identity, op.artifacts, phase, outcome, cancelRequested)
         decision <-
           if isClosed then IO.pure(Left(SubmitRejection.Closed))
           else
             tasks.modify { current =>
               current.get(key) match
                 case Some(existing)
-                    if existing.descriptor == op.descriptor && existing.inputIdentity == identity =>
+                    if existing.descriptor == op.descriptor &&
+                      existing.inputIdentity == identity &&
+                      existing.artifacts == op.artifacts =>
                   (current, Right(existing))
                 case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
                 case None    => (current.updated(key, candidate), Right(candidate))
@@ -375,10 +384,17 @@ object LocalSite:
                 ): TaskOutcome[Nothing]
               )
             case Right(bytes) =>
-              registered.run(bytes).flatMap {
-                case Left(failure)      => IO.pure(failed(failure): TaskOutcome[Nothing])
-                case Right(resultBytes) => publish(registered, resultBytes)
-              }
+              for
+                publisher <- ArtifactPublisher.create[IO](fsStore, registered.artifacts)
+                executed <- registered.runWithContext(
+                  bytes,
+                  OperationContext(publisher)
+                )
+                result <- executed match
+                  case Left(failure)      => IO.pure(failed(failure): TaskOutcome[Nothing])
+                  case Right(resultBytes) =>
+                    publisher.finish.flatMap(publish(registered, resultBytes, _))
+              yield result
         yield outcome
 
       val interrupted: IO[TaskOutcome[Nothing]] =
@@ -409,7 +425,8 @@ object LocalSite:
 
     private def publish(
         registered: RegisteredOperation[IO],
-        resultBytes: Vector[Byte]
+        resultBytes: Vector[Byte],
+        artifacts: Either[ArtifactPublicationFailure, ArtifactSet]
     ): IO[TaskOutcome[Nothing]] =
       SchemaId.from(registered.descriptor.resultSchema.value) match
         case Left(failure) =>
@@ -425,7 +442,18 @@ object LocalSite:
         case Right(schema) =>
           fsStore.putBytes(resultBytes, schema).map {
             case Right(ref) =>
-              TaskOutcome.Succeeded(RemoteRef[Nothing](ref.site, ref.path, ref.digest, ref.schema))
+              val result =
+                RemoteRef[Nothing](ref.site, ref.path, ref.digest, ref.schema)
+              artifacts match
+                case Right(values) => TaskOutcome.Succeeded(result, values)
+                case Left(failure) =>
+                  TaskOutcome.PublicationFailed(
+                    result,
+                    failure,
+                    Diagnostics.one(
+                      Diagnostic("artifact-publication-failed", failure.toString)
+                    )
+                  )
             case Left(storeFailure) =>
               // The result was produced; persisting it failed. That is a runtime fault of the
               // site, not an invalid result — label it honestly and keep the evidence.

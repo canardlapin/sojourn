@@ -1,10 +1,10 @@
 package io.github.bbuchsbaum.sojourn.tck
 
-import io.github.bbuchsbaum.scalaslurm.core.InputCodec
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodec
-import io.github.bbuchsbaum.scalaslurm.core.ResultCodecFailure
-import io.github.bbuchsbaum.scalaslurm.core.ResultSchemaId
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodecFailure
+import io.github.bbuchsbaum.remoteexec.kernel.ResultSchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 
 import java.nio.charset.StandardCharsets
 
