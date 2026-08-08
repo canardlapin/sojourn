@@ -7,6 +7,8 @@ import cats.effect.kernel.Ref
 import cats.effect.kernel.Resource
 import cats.effect.std.Supervisor
 import cats.syntax.all.*
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
 import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
 import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
@@ -105,7 +107,9 @@ object LocalSite:
       fingerprint: RequestFingerprint,
       phase: Ref[IO, TaskPhase],
       outcome: Deferred[IO, TaskResult[Nothing]],
-      cancelRequested: Deferred[IO, Unit]
+      cancelRequested: Deferred[IO, Unit],
+      attemptId: AttemptId,
+      startedAt: Instant
   )
 
   final private class LocalSiteImpl(
@@ -371,39 +375,48 @@ object LocalSite:
         phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
         outcome <- Deferred[IO, TaskResult[Nothing]]
         cancelRequested <- Deferred[IO, Unit]
-        candidate = LocalTask(proposed, phase, outcome, cancelRequested)
-        decision <- IO.uncancelable { _ =>
-          closed.get.flatMap { isClosed =>
-            if isClosed then IO.pure(Left(SubmitRejection.Closed))
-            else
-              tasks.modify { current =>
-                current.get(key) match
-                  case Some(existing) if existing.fingerprint == proposed =>
-                    (current, Right(existing))
-                  case Some(existing) =>
-                    (current, Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed)))
-                  case None => (current.updated(key, candidate), Right(candidate))
-              }.flatMap {
-                case Left(rejection) => IO.pure(Left(rejection))
-                case Right(task) if task eq candidate =>
-                  // Post-insert closed recheck (parity with pool): withdraw if release won the race.
-                  closed.get.flatMap {
-                    case true =>
-                      tasks.update(_ - key).as(Left(SubmitRejection.Closed))
-                    case false => IO.pure(Right(task))
-                  }
-                case Right(task) => IO.pure(Right(task))
-              }
-          }
-        }
-        handle <- decision match
+        startedAt <- IO.realTimeInstant
+        attemptId <- mintAttemptId(key)
+        handle <- attemptId match
           case Left(rejection) => IO.pure(Left(rejection))
-          case Right(task)     =>
-            val start =
-              if task eq candidate then
-                supervisor.supervise(execute(registered, prepared, task)).void
-              else IO.unit
-            start.as(Right(taskHandle[O](key, task)))
+          case Right(minted)   =>
+            val candidate =
+              LocalTask(proposed, phase, outcome, cancelRequested, minted, startedAt)
+            IO.uncancelable { _ =>
+              closed.get.flatMap { isClosed =>
+                if isClosed then IO.pure(Left(SubmitRejection.Closed))
+                else
+                  tasks.modify { current =>
+                    current.get(key) match
+                      case Some(existing) if existing.fingerprint == proposed =>
+                        (current, Right(existing))
+                      case Some(existing) =>
+                        (
+                          current,
+                          Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed))
+                        )
+                      case None => (current.updated(key, candidate), Right(candidate))
+                  }.flatMap {
+                    case Left(rejection) => IO.pure(Left(rejection))
+                    case Right(task) if task eq candidate =>
+                      // Post-insert closed recheck (parity with pool): withdraw if release won.
+                      closed.get.flatMap {
+                        case true =>
+                          tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                        case false => IO.pure(Right(task))
+                      }
+                    case Right(task) => IO.pure(Right(task))
+                  }
+              }
+            }.flatMap {
+              case Left(rejection) => IO.pure(Left(rejection))
+              case Right(task)     =>
+                val start =
+                  if task eq candidate then
+                    supervisor.supervise(execute(registered, prepared, task)).void
+                  else IO.unit
+                start.as(Right(taskHandle[O](key, task)))
+            }
       yield handle
 
     private def execute(
@@ -604,19 +617,40 @@ object LocalSite:
         case OperationRunFailure.Execution(code, message) => s"$code: $message"
         case OperationRunFailure.InvalidResult(detail)    => detail
 
+    private def mintAttemptId(key: SubmissionKey): IO[Either[SubmitRejection, AttemptId]] =
+      IO(UUID.randomUUID().toString.toLowerCase).map { uuid =>
+        AttemptId
+          .from(s"${key.value}-a$uuid")
+          .left
+          .map(failure => SubmitRejection.InvalidInput(failure))
+      }
+
     private def settleLocal(task: LocalTask, outcome: TaskOutcome[Nothing]): IO[Unit] =
-      task.phase.update(TaskPhase.advance(_, TaskPhase.Settled)) *>
-        task.outcome
-          .complete(
-            TaskResult(
-              outcome,
-              TaskReport.fromOutcome(
+      IO.realTimeInstant.flatMap { finishedAt =>
+        val attempt = AttemptRecord(
+          attemptId = task.attemptId,
+          epoch = AttemptEpoch.initial,
+          startedAt = Some(task.startedAt),
+          finishedAt = Some(finishedAt),
+          worker = None,
+          allocation = None,
+          interruption = TaskReport.interruptionOf(outcome),
+          indeterminacy = TaskReport.indeterminacyOf(outcome)
+        )
+        task.phase.update(TaskPhase.advance(_, TaskPhase.Settled)) *>
+          task.outcome
+            .complete(
+              TaskResult(
                 outcome,
-                requestFingerprint = Some(task.fingerprint)
+                TaskReport.fromOutcome(
+                  outcome,
+                  requestFingerprint = Some(task.fingerprint),
+                  attempts = Vector(attempt)
+                )
               )
             )
-          )
-          .void
+            .void
+      }
 
     private def taskHandle[O](submissionKey: SubmissionKey, task: LocalTask): TaskHandle[IO, O] =
       new TaskHandle[IO, O]:

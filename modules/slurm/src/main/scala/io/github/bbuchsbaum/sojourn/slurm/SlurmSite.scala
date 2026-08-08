@@ -42,6 +42,7 @@ import io.github.bbuchsbaum.sojourn.runtime.SitePreflight
 import java.nio.file.Files as JFiles
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.time.Instant
 import scala.concurrent.duration.*
 
 /** Configuration for a Slurm-backed site driven through the local CLI on a host that shares a POSIX
@@ -337,7 +338,11 @@ object SlurmSite:
   final private case class SlurmTask(
       fingerprint: RequestFingerprint,
       outcome: Deferred[IO, TaskResult[Nothing]],
-      lastPhase: Ref[IO, TaskPhase]
+      lastPhase: Ref[IO, TaskPhase],
+      attemptId: AttemptId,
+      epoch: AttemptEpoch,
+      startedAt: Instant,
+      allocation: Option[String]
   )
 
   final private class ControllerManagedBatchExecutor(
@@ -365,18 +370,16 @@ object SlurmSite:
         input: TaskInput[I],
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-      IO.uncancelable { _ =>
-        for
-          isClosed <- closed.get
-          outcome <-
-            if isClosed then IO.pure(Left(SubmitRejection.Closed))
-            else
-              resolveInput(op, input).flatMap {
-                case Left(rejection)          => IO.pure(Left(rejection))
-                case Right((value, identity)) =>
-                  prepareAndAdmit(op, value, RequestFingerprint.compute(op, identity), key)
-              }
-        yield outcome
+      // Closed check + process-local attachment registration are the uncancelable boundary;
+      // prepare/submit/inspect are cancelable external work (see attachToAttempt).
+      closed.get.flatMap { isClosed =>
+        if isClosed then IO.pure(Left(SubmitRejection.Closed))
+        else
+          resolveInput(op, input).flatMap {
+            case Left(rejection)          => IO.pure(Left(rejection))
+            case Right((value, identity)) =>
+              prepareAndAdmit(op, value, RequestFingerprint.compute(op, identity), key)
+          }
       }
 
     /** Prepare and durably record before returning a handle.
@@ -510,11 +513,32 @@ object SlurmSite:
         fingerprint: RequestFingerprint,
         outcome: TaskOutcome[Nothing]
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-      Deferred[IO, TaskResult[Nothing]].flatMap { settled =>
-        Ref.of[IO, TaskPhase](TaskPhase.Queued).flatMap { phase =>
-          val task = SlurmTask(fingerprint, settled, phase)
-          settle(task, outcome).as(Right(taskHandle[O](key, task)))
-        }
+      for
+        settled <- Deferred[IO, TaskResult[Nothing]]
+        phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
+        startedAt <- Clock[IO].realTimeInstant
+        attemptId <- mintLocalAttemptId(key)
+        handle <- attemptId match
+          case Left(rejection) => IO.pure(Left(rejection))
+          case Right(minted)   =>
+            val task = SlurmTask(
+              fingerprint,
+              settled,
+              phase,
+              minted,
+              AttemptEpoch.initial,
+              startedAt,
+              None
+            )
+            settle(task, outcome).as(Right(taskHandle[O](key, task)))
+      yield handle
+
+    private def mintLocalAttemptId(key: SubmissionKey): IO[Either[SubmitRejection, AttemptId]] =
+      IO(java.util.UUID.randomUUID().toString.toLowerCase).map { uuid =>
+        AttemptId
+          .from(s"${key.value}-a$uuid")
+          .left
+          .map(failure => SubmitRejection.InvalidInput(failure))
       }
 
     private def attachToAttempt[O](
@@ -528,42 +552,68 @@ object SlurmSite:
       for
         settled <- Deferred[IO, TaskResult[Nothing]]
         phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
-        candidate = SlurmTask(fingerprint, settled, phase)
-        task <- tasks.modify { current =>
-          current.get(key) match
-            case Some(existing) if existing.fingerprint == fingerprint =>
-              current -> existing
-            case Some(existing) =>
-              current -> existing // conflict is owned by managed submit; keep first attachment
-            case None => current.updated(key, candidate) -> candidate
+        startedAt <- Clock[IO].realTimeInstant
+        allocation = attempt.currentJob.map { job =>
+          job.arrayIndex match
+            case Some(index) => s"${job.jobId.value}_${index.value}"
+            case None        => job.jobId.value
+        }
+        candidate = SlurmTask(
+          fingerprint,
+          settled,
+          phase,
+          attempt.intent.attemptId,
+          attempt.intent.epoch,
+          startedAt,
+          allocation
+        )
+        // Process-local attachment insert is the registration boundary.
+        task <- IO.uncancelable { _ =>
+          closed.get.flatMap {
+            case true => IO.pure(candidate) // drive path will see closed via supervise failure
+            case false =>
+              tasks.modify { current =>
+                current.get(key) match
+                  case Some(existing) if existing.fingerprint == fingerprint =>
+                    current -> existing
+                  case Some(existing) =>
+                    current -> existing // conflict owned by managed submit; keep first attachment
+                  case None => current.updated(key, candidate) -> candidate
+              }
+          }
         }
         result <-
           if task.fingerprint != fingerprint then
             IO.pure(Left(SubmitRejection.Conflict(key, task.fingerprint, fingerprint)))
           else if task ne candidate then IO.pure(Right(taskHandle[O](key, task)))
           else
-            supervisor
-              .supervise(
-                drive(key, prepared, contract, declarations, task, attempt).onCancel(
-                  settle(
-                    task,
-                    TaskOutcome.Unknown(
-                      Diagnostics.one(
-                        Diagnostic(
-                          "site-closed",
-                          "the site was released before this task settled"
+            closed.get.flatMap {
+              case true =>
+                tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+              case false =>
+                supervisor
+                  .supervise(
+                    drive(key, prepared, contract, declarations, task, attempt).onCancel(
+                      settle(
+                        task,
+                        TaskOutcome.Unknown(
+                          Diagnostics.one(
+                            Diagnostic(
+                              "site-closed",
+                              "the site was released before this task settled"
+                            )
+                          )
                         )
                       )
                     )
                   )
-                )
-              )
-              .attempt
-              .flatMap {
-                case Right(_) => IO.pure(Right(taskHandle[O](key, task)))
-                case Left(_)  =>
-                  tasks.update(_ - key).as(Left(SubmitRejection.Closed))
-              }
+                  .attempt
+                  .flatMap {
+                    case Right(_) => IO.pure(Right(taskHandle[O](key, task)))
+                    case Left(_)  =>
+                      tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                  }
+            }
       yield result
 
     /** Resolve the task input to its typed value plus its identity digest. */
@@ -636,15 +686,31 @@ object SlurmSite:
 
     /** Idempotently settle a task (first writer wins). */
     private def settle(task: SlurmTask, result: TaskOutcome[Nothing]): IO[Unit] =
-      task.lastPhase.update(TaskPhase.advance(_, TaskPhase.Settled)) *>
-        task.outcome
-          .complete(
-            TaskResult(
-              result,
-              TaskReport.fromOutcome(result, requestFingerprint = Some(task.fingerprint))
+      Clock[IO].realTimeInstant.flatMap { finishedAt =>
+        val attempt = AttemptRecord(
+          attemptId = task.attemptId,
+          epoch = task.epoch,
+          startedAt = Some(task.startedAt),
+          finishedAt = Some(finishedAt),
+          worker = None,
+          allocation = task.allocation,
+          interruption = TaskReport.interruptionOf(result),
+          indeterminacy = TaskReport.indeterminacyOf(result)
+        )
+        task.lastPhase.update(TaskPhase.advance(_, TaskPhase.Settled)) *>
+          task.outcome
+            .complete(
+              TaskResult(
+                result,
+                TaskReport.fromOutcome(
+                  result,
+                  requestFingerprint = Some(task.fingerprint),
+                  attempts = Vector(attempt)
+                )
+              )
             )
-          )
-          .void
+            .void
+      }
 
     private def taskHandle[O](submissionKey: SubmissionKey, task: SlurmTask): TaskHandle[IO, O] =
       new TaskHandle[IO, O]:

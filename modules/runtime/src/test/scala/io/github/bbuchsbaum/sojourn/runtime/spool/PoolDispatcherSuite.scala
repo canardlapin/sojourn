@@ -35,6 +35,8 @@ import io.github.bbuchsbaum.sojourn.SiteOperation
 import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.TaskInput
 import io.github.bbuchsbaum.sojourn.TaskOutcome
+import io.github.bbuchsbaum.sojourn.TaskLifecycle
+import io.github.bbuchsbaum.sojourn.TaskPhase
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.runtime.KeyToken
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
@@ -361,6 +363,17 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           epochTwo <- orRaise(AttemptEpoch.from(2L))
           _ <- eventually(
             pendingExists(env, key, epochTwo).map(exists => if exists then Some(()) else None)
+          )
+          // Automatic retry is Active: bump advances to at least Dispatched (never regresses).
+          statusAfterBump <- eventually(
+            handle.status.map { status =>
+              Option.when(TaskPhase.lifecycle(status.phase) == TaskLifecycle.Active)(status)
+            }
+          )
+          _ = assertNotEquals(
+            statusAfterBump.phase,
+            TaskPhase.Queued,
+            s"retry must not remain Queued; observed $statusAfterBump"
           )
           // A late e1 publication succeeds on the wire (I2 is per-epoch) but the fence keeps it
           // from ever settling the handle. Identity is copied from the live e2 invocation —

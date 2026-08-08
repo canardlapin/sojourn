@@ -123,7 +123,7 @@ final class SimplePool private[dsl] (
   def awaitGranted: IO[Either[LeaseRevocation, PilotCount]] =
     pool.lease.awaitGranted
 
-/** A [[Site]] with the ceremony folded away. Pool acquisition requires a [[PoolCapableSite]]. */
+/** A [[Site]] with the ceremony folded away. Batch constructors (e.g. Slurm today) return this. */
 final class SimpleSite private[dsl] (val raw: Site[IO]):
   private val runner = SimpleRunner(raw.batch, raw.store)
   export runner.{put, run, submit, submitStored}
@@ -133,7 +133,15 @@ final class SimpleSite private[dsl] (val raw: Site[IO]):
   def operations: OperationCatalog = raw.operations
   def store: SiteStore[IO] = raw.store
 
-  /** Acquire a leased pilot pool. Requires [[raw]] to be a [[PoolCapableSite]]. */
+object SimpleSite:
+  def apply(site: Site[IO]): SimpleSite = new SimpleSite(site)
+
+/** A [[PoolCapableSite]] with the ceremony folded away — typed pool acquisition, no cast / UOE. */
+final class SimplePoolCapableSite private[dsl] (val capable: PoolCapableSite[IO]):
+  private val site = SimpleSite(capable)
+  export site.{raw, name, id, operations, store, put, run, submit, submitStored}
+
+  /** Acquire a leased pilot pool. */
   def pool(
       pilots: Int = 2,
       minReady: Int = 1,
@@ -142,22 +150,14 @@ final class SimpleSite private[dsl] (val raw: Site[IO]):
       drainGrace: FiniteDuration = 30.seconds,
       readyTimeout: FiniteDuration = 2.minutes
   ): Resource[IO, SimplePool] =
-    raw match
-      case capable: PoolCapableSite[IO] @unchecked =>
-        Resource
-          .eval(
-            IO.fromEither(
-              poolSpec(pilots, minReady, walltimeMinutes, heartbeat, drainGrace, readyTimeout)
-            )
-          )
-          .flatMap(capable.pools.acquire)
-          .map(pool => SimplePool(pool, SimpleRunner(pool, raw.store)))
-      case _ =>
-        Resource.raiseError[IO, SimplePool, Throwable](
-          new UnsupportedOperationException(
-            s"site '${raw.name.value}' does not implement PoolCapableSite"
-          )
+    Resource
+      .eval(
+        IO.fromEither(
+          poolSpec(pilots, minReady, walltimeMinutes, heartbeat, drainGrace, readyTimeout)
         )
+      )
+      .flatMap(capable.pools.acquire)
+      .map(pool => SimplePool(pool, SimpleRunner(pool, capable.store)))
 
   private def poolSpec(
       pilots: Int,
@@ -178,8 +178,8 @@ final class SimpleSite private[dsl] (val raw: Site[IO]):
       spec <- PoolSpec.from(pilotCount, ready, walltime, grace, beat, readyBound, root)
     yield spec).left.map(failure => new IllegalArgumentException(failure.reason))
 
-object SimpleSite:
-  def apply(site: Site[IO]): SimpleSite = new SimpleSite(site)
+object SimplePoolCapableSite:
+  def apply(site: PoolCapableSite[IO]): SimplePoolCapableSite = new SimplePoolCapableSite(site)
 
 /** Backend-free DSL helpers. Site constructors live in `sojourn-all` ([[Sojourn]]). */
 object Dsl:

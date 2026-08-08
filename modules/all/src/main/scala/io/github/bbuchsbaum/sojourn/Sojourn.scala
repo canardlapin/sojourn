@@ -9,6 +9,7 @@ import io.github.bbuchsbaum.slurm4s.core.ResourceRequest
 import io.github.bbuchsbaum.slurm4s.ssh.SlurmSshConfig
 import io.github.bbuchsbaum.sojourn.dsl.Op
 import io.github.bbuchsbaum.sojourn.dsl.Program
+import io.github.bbuchsbaum.sojourn.dsl.SimplePoolCapableSite
 import io.github.bbuchsbaum.sojourn.dsl.SimpleSite
 import io.github.bbuchsbaum.sojourn.local.LocalSite
 import io.github.bbuchsbaum.sojourn.local.LocalSiteConfig
@@ -21,20 +22,20 @@ import java.util.Comparator
 
 /** One-call site construction. Lives in `sojourn-all` so `sojourn-dsl` stays backend-free.
   *
-  *   - [[local]] / [[localAt]] → [[PoolCapableSite]]
-  *   - [[slurm4sBatch]] / [[slurm]] → [[Site]] (batch; pools land before 1.0.0)
+  *   - [[local]] / [[localAt]] → [[SimplePoolCapableSite]]
+  *   - [[slurm4sBatch]] / [[slurm]] → [[SimpleSite]] (batch; pools land before 1.0.0)
   */
 object Sojourn:
-  def local(name: String, ops: Op[?, ?]*): Resource[IO, SimpleSite] =
+  def local(name: String, ops: Op[?, ?]*): Resource[IO, SimplePoolCapableSite] =
     local(name, Program(ops*))
 
-  def local(name: String, program: Program): Resource[IO, SimpleSite] =
+  def local(name: String, program: Program): Resource[IO, SimplePoolCapableSite] =
     temporaryRoot.flatMap(root => localAt(name, root, program))
 
-  def localAt(name: String, root: Path, ops: Op[?, ?]*): Resource[IO, SimpleSite] =
+  def localAt(name: String, root: Path, ops: Op[?, ?]*): Resource[IO, SimplePoolCapableSite] =
     localAt(name, root, Program(ops*))
 
-  def localAt(name: String, root: Path, program: Program): Resource[IO, SimpleSite] =
+  def localAt(name: String, root: Path, program: Program): Resource[IO, SimplePoolCapableSite] =
     for
       site <- Resource.eval(parseSiteName(name))
       registry <- Resource.eval(
@@ -46,7 +47,7 @@ object Sojourn:
         LocalSiteConfig(site, root, ByteLimit.maximumCommandCapture),
         registry
       )
-    yield SimpleSite(backend)
+    yield SimplePoolCapableSite(backend)
 
   /** Slurm batch site — returns [[Site]], not a throwing pool. */
   def slurm4sBatch(

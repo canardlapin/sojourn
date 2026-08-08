@@ -117,6 +117,7 @@ object PoolDispatcher:
       retriesUsed: Ref[IO, Int],
       status: Ref[IO, TaskStatus],
       evidence: Ref[IO, Vector[Diagnostic]],
+      attempts: Ref[IO, Vector[AttemptRecord]],
       outcome: Deferred[IO, TaskResult[Nothing]]
   )
 
@@ -314,79 +315,97 @@ object PoolDispatcher:
         case PreparedInput.Carried(_, digest)    => digest
         case PreparedInput.Referenced(_, digest) => digest
       val proposed = RequestFingerprint.compute(op, identity)
+      // Mask only the registration boundary (closed check + insert + post-insert recheck).
+      // Staging / spool publish is cancelable external work — LocalSite's shape.
+      register(op, identity, proposed, key).flatMap {
+        case Left(rejection) => IO.pure(Left(rejection))
+        case Right(Registered.Existing(task)) =>
+          IO.pure(Right(taskHandle[O](task)))
+        case Right(Registered.Fresh(task, minted, submittedAt)) =>
+          stageAndPublish(op, prepared, minted, submittedAt, task)
+            .as(Right(taskHandle[O](task)))
+      }
+
+    /** Outcome of the uncancelable registration boundary. */
+    private enum Registered:
+      case Existing(task: PoolTask)
+      case Fresh(task: PoolTask, attemptId: AttemptId, submittedAt: Instant)
+
+    private def register[I, O](
+        op: SiteOperation[I, O],
+        identity: ContentDigest,
+        proposed: RequestFingerprint,
+        key: SubmissionKey
+    ): IO[Either[SubmitRejection, Registered]] =
+      val token = KeyToken.forKey(key).value
       IO.uncancelable { _ =>
         state.closed.get.flatMap { isClosed =>
           if isClosed then IO.pure(Left(SubmitRejection.Closed))
           else
             state.tasks.get.map(_.get(key)).flatMap {
               case Some(existing) if existing.fingerprint == proposed =>
-                IO.pure(Right(taskHandle[O](existing)))
+                IO.pure(Right(Registered.Existing(existing)))
               case Some(existing) =>
                 IO.pure(Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed)))
-              case None => create(op, prepared, identity, proposed, key)
+              case None =>
+                for
+                  submittedAt <- now
+                  attemptId <- mintAttemptId(token)
+                  registered <- attemptId match
+                    case Left(rejection) => IO.pure(Left(rejection))
+                    case Right(minted)   =>
+                      for
+                        epoch <- Ref.of[IO, AttemptEpoch](AttemptEpoch.initial)
+                        retries <- Ref.of[IO, Int](0)
+                        status <- Ref.of[IO, TaskStatus](
+                          TaskStatus(TaskPhase.Queued, Freshness.Current(submittedAt))
+                        )
+                        evidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
+                        attempts <- Ref.of[IO, Vector[AttemptRecord]](Vector.empty)
+                        deferred <- Deferred[IO, TaskResult[Nothing]]
+                        candidate = PoolTask(
+                          key,
+                          token,
+                          proposed,
+                          op.descriptor,
+                          identity,
+                          epoch,
+                          retries,
+                          status,
+                          evidence,
+                          attempts,
+                          deferred
+                        )
+                        decision <- state.tasks.modify { current =>
+                          current.get(key) match
+                            case Some(existing) if existing.fingerprint == proposed =>
+                              (current, Right(existing))
+                            case Some(existing) =>
+                              (
+                                current,
+                                Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed))
+                              )
+                            case None => (current.updated(key, candidate), Right(candidate))
+                        }
+                        outcome <- decision match
+                          case Left(rejection) => IO.pure(Left(rejection))
+                          case Right(task) if task eq candidate =>
+                            // Re-check closure AFTER the insertion: `closed` flips before the
+                            // terminal sweep enumerates tasks, so an insert the sweep cannot see
+                            // must observe the flag here and withdraw — otherwise the handle
+                            // could never settle.
+                            state.closed.get.flatMap {
+                              case true =>
+                                state.tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                              case false =>
+                                IO.pure(Right(Registered.Fresh(task, minted, submittedAt)))
+                            }
+                          case Right(task) => IO.pure(Right(Registered.Existing(task)))
+                      yield outcome
+                yield registered
             }
         }
       }
-
-    private def create[I, O](
-        op: SiteOperation[I, O],
-        prepared: PreparedInput,
-        identity: ContentDigest,
-        proposed: RequestFingerprint,
-        key: SubmissionKey
-    ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-      val token = KeyToken.forKey(key).value
-      for
-        submittedAt <- now
-        attemptId <- mintAttemptId(token)
-        outcome <- attemptId match
-          case Left(rejection) => IO.pure(Left(rejection))
-          case Right(minted)   =>
-            for
-              epoch <- Ref.of[IO, AttemptEpoch](AttemptEpoch.initial)
-              retries <- Ref.of[IO, Int](0)
-              status <- Ref.of[IO, TaskStatus](
-                TaskStatus(TaskPhase.Queued, Freshness.Current(submittedAt))
-              )
-              evidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
-              deferred <- Deferred[IO, TaskResult[Nothing]]
-              candidate = PoolTask(
-                key,
-                token,
-                proposed,
-                op.descriptor,
-                identity,
-                epoch,
-                retries,
-                status,
-                evidence,
-                deferred
-              )
-              decision <- state.tasks.modify { current =>
-                current.get(key) match
-                  case Some(existing) if existing.fingerprint == proposed =>
-                    (current, Right(existing))
-                  case Some(existing) =>
-                    (current, Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed)))
-                  case None => (current.updated(key, candidate), Right(candidate))
-              }
-              handle <- decision match
-                case Left(rejection) => IO.pure(Left(rejection))
-                case Right(task)     =>
-                  if task eq candidate then
-                    // Re-check closure AFTER the insertion: `closed` flips before the terminal
-                    // sweep enumerates tasks, so an insert the sweep cannot see must observe the
-                    // flag here and withdraw — otherwise the handle could never settle.
-                    state.closed.get.flatMap {
-                      case true =>
-                        state.tasks.update(_ - key).as(Left(SubmitRejection.Closed))
-                      case false =>
-                        stageAndPublish(op, prepared, minted, submittedAt, task)
-                          .as(Right(taskHandle[O](task)))
-                    }
-                  else IO.pure(Right(taskHandle[O](task)))
-            yield handle
-      yield outcome
 
     /** Stage the input and publish the epoch-1 invocation for a freshly admitted task. Both failure
       * modes are infrastructure faults of the site, not input validation problems: the task is
@@ -457,7 +476,8 @@ object PoolDispatcher:
 
     private def publishNewInvocation(task: PoolTask, invocation: SpoolInvocation): IO[Unit] =
       spool.publishInvocation(invocation).flatMap {
-        case Right(())          => IO.unit
+        case Right(()) =>
+          openAttempt(task, invocation.attemptId, invocation.attemptEpoch, invocation.publishedAt)
         case Left(writeFailure) =>
           // The invocation never reached the spool: the task provably never ran, but this is an
           // infrastructure fault of the site, reported as a settled failure with the evidence.
@@ -823,9 +843,18 @@ object PoolDispatcher:
           val republished = invocation.copy(attemptEpoch = nextEpoch, publishedAt = tick)
           spool.publishInvocation(republished).flatMap {
             case Right(()) =>
+              // Keep TaskPhase monotone: a claimed-then-reclaimed attempt is Active. Advance to
+              // at least Dispatched; never regress Running/Dispatched → Queued.
               task.epoch.set(nextEpoch) *>
                 task.retriesUsed.update(_ + 1) *>
-                task.status.set(TaskStatus(TaskPhase.Queued, Freshness.Current(tick))) *>
+                task.status.update(previous =>
+                  TaskStatus(
+                    TaskPhase.advance(previous.phase, TaskPhase.Dispatched),
+                    Freshness.Current(tick)
+                  )
+                ) *>
+                finishLatestAttempt(task, tick) *>
+                openAttempt(task, republished.attemptId, nextEpoch, tick) *>
                 recordTask(
                   task,
                   Diagnostic(
@@ -1028,14 +1057,15 @@ object PoolDispatcher:
               case Right(name) =>
                 val owner = claimOwners.get(name)
                 val holderTrack = owner.map(pilot => tracks.getOrElse(pilot, PilotTrack.initial))
-                task.status.get.flatMap { previous =>
-                  if previous.phase == TaskPhase.Settled then IO.unit
+                // Atomic update: never regress Terminal if settle won the race after our read.
+                task.status.update { previous =>
+                  if previous.phase == TaskPhase.Settled then previous
                   else
                     val phase =
                       if pendingNames.contains(name) then TaskPhase.Queued
                       else
                         owner match
-                          case Some(pilot) =>
+                          case Some(_) =>
                             val fresh = holderTrack.exists(track => !isStale(track, tick))
                             val claimsIt = holderTrack.exists(track =>
                               track.heartbeat.exists(beat =>
@@ -1044,7 +1074,6 @@ object PoolDispatcher:
                             )
                             if fresh && claimsIt then TaskPhase.Running else TaskPhase.Dispatched
                           case None => previous.phase
-                    val nextPhase = TaskPhase.advance(previous.phase, phase)
                     val holderUnknown = holderTrack.exists(track =>
                       track.liveness match
                         case PilotLiveness.Unobservable(_)                     => isStale(track, tick)
@@ -1065,8 +1094,8 @@ object PoolDispatcher:
                           )
                         )
                       else Freshness.Current(tick)
-                    task.status.set(TaskStatus(nextPhase, freshness))
-                }
+                    TaskStatus(TaskPhase.advance(previous.phase, phase), freshness)
+                }.void
           }
         }
       yield ()
@@ -1509,24 +1538,72 @@ object PoolDispatcher:
       )
 
     private def settle(task: PoolTask, outcome: TaskOutcome[Nothing]): IO[Unit] =
-      task.evidence.get.flatMap { evidence =>
-        val result = TaskResult(
+      for
+        evidence <- task.evidence.get
+        tick <- now
+        attempts <- closeOpenAttempts(task, tick, outcome)
+        result = TaskResult(
           outcome,
           TaskReport.fromOutcome(
             outcome,
             evidence = evidence,
             requestFingerprint = Some(task.fingerprint),
             catalogFingerprint = Some(catalogFingerprint),
-            inputDigest = Some(task.inputIdentity)
+            inputDigest = Some(task.inputIdentity),
+            attempts = attempts
           )
         )
-        task.outcome.complete(result).flatMap {
-          case false => IO.unit
-          case true  =>
-            now.flatMap(tick =>
-              task.status.set(TaskStatus(TaskPhase.Settled, Freshness.Current(tick)))
+        // Mark Settled before completing the Deferred so awaiters never observe a
+        // non-terminal status, and so a concurrent phaseScan cannot overwrite Terminal.
+        _ <- task.status.set(TaskStatus(TaskPhase.Settled, Freshness.Current(tick)))
+        _ <- task.outcome.complete(result).void
+      yield ()
+
+    private def openAttempt(
+        task: PoolTask,
+        attemptId: AttemptId,
+        epoch: AttemptEpoch,
+        at: Instant
+    ): IO[Unit] =
+      task.attempts.update(
+        _ :+ AttemptRecord(
+          attemptId = attemptId,
+          epoch = epoch,
+          startedAt = Some(at),
+          finishedAt = None,
+          worker = None,
+          allocation = None,
+          interruption = None,
+          indeterminacy = None
+        )
+      )
+
+    private def finishLatestAttempt(task: PoolTask, at: Instant): IO[Unit] =
+      task.attempts.update { records =>
+        records.lastOption match
+          case Some(last) if last.finishedAt.isEmpty =>
+            records.init :+ last.copy(finishedAt = Some(at))
+          case _ => records
+      }
+
+    private def closeOpenAttempts(
+        task: PoolTask,
+        at: Instant,
+        outcome: TaskOutcome[?]
+    ): IO[Vector[AttemptRecord]] =
+      val interruption = TaskReport.interruptionOf(outcome)
+      val indeterminacy = TaskReport.indeterminacyOf(outcome)
+      task.attempts.modify { records =>
+        val closed = records.map { record =>
+          if record.finishedAt.isEmpty then
+            record.copy(
+              finishedAt = Some(at),
+              interruption = interruption,
+              indeterminacy = indeterminacy
             )
+          else record
         }
+        (closed, closed)
       }
 
     private def recordTask(task: PoolTask, diagnostic: Diagnostic): IO[Unit] =
