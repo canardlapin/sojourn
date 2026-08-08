@@ -2,13 +2,13 @@ package io.github.bbuchsbaum.sojourn.demo
 
 import cats.effect.IO
 import cats.effect.Resource
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
-import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
-import io.github.bbuchsbaum.scalaslurm.core.ResourceRequest
-import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.remoteexec.kernel.DurationMillis
+import io.github.bbuchsbaum.remoteexec.kernel.PositiveInt
+import io.github.bbuchsbaum.slurm4s.core.ResourceRequest
+import io.github.bbuchsbaum.remoteexec.kernel.WallTimeMinutes
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
 import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath

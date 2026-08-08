@@ -1,5 +1,6 @@
 package io.github.bbuchsbaum.sojourn.runtime
 
+import scodec.bits.ByteVector
 import cats.effect.IO
 import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
 import io.github.bbuchsbaum.remoteexec.kernel.OperationDescriptor
@@ -72,9 +73,9 @@ class OperationRegistrySuite extends munit.CatsEffectSuite:
 
   private val inputCodec = new InputCodec[String]:
     def schemaId: SchemaId = inputSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       val value = new String(bytes.toArray, StandardCharsets.UTF_8)
       Either.cond(
         value != "bad-input",
@@ -84,13 +85,13 @@ class OperationRegistrySuite extends munit.CatsEffectSuite:
 
   private val resultCodec = new ResultCodec[String]:
     def schemaId: ResultSchemaId = resultSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
       Either.cond(
         value != "bad-result",
-        value.getBytes(StandardCharsets.UTF_8).toVector,
+        ByteVector.view(value.getBytes(StandardCharsets.UTF_8)),
         ResultCodecFailure("bad-result", "deliberate result failure")
       )
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
 
   private def operation(name: String): SiteOperation[String, String] =
@@ -146,14 +147,14 @@ class OperationRegistrySuite extends munit.CatsEffectSuite:
       .from[IO](Vector(OperationRegistry.entry(op)(_ => IO.pure("bad-result"))))
       .toOption
       .get
-    val inputBytes = "ok".getBytes(StandardCharsets.UTF_8).toVector
+    val inputBytes = ByteVector.view("ok".getBytes(StandardCharsets.UTF_8))
     for
       raisedResult <- raised.lookup(op.descriptor).get.run(inputBytes)
       codecResult <- badResult.lookup(op.descriptor).get.run(inputBytes)
       inputResult <- badResult
         .lookup(op.descriptor)
         .get
-        .run("bad-input".getBytes(StandardCharsets.UTF_8).toVector)
+        .run(ByteVector.view("bad-input".getBytes(StandardCharsets.UTF_8)))
     yield
       assert(raisedResult.left.exists {
         case OperationRunFailure.Execution("operation-raised", "boom") => true

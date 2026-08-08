@@ -85,13 +85,16 @@ jobs:
         if: matrix.java == 'temurin@17' && matrix.os == 'ubuntu-22.04'
         run: sbt '++ ${{ matrix.scala }}' doc
 
+      - name: Check module boundaries
+        run: sbt '++ ${{ matrix.scala }}' checkModuleBoundaries
+
       - name: Make target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: mkdir -p modules/core/target project/target
+        run: mkdir -p modules/all/target modules/local/target modules/slurm/target modules/tck/target modules/core/target modules/dsl/target modules/runtime/target modules/worker/target project/target
 
       - name: Compress target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
-        run: tar cf targets.tar modules/core/target project/target
+        run: tar cf targets.tar modules/all/target modules/local/target modules/slurm/target modules/tck/target modules/core/target modules/dsl/target modules/runtime/target modules/worker/target project/target
 
       - name: Upload target directories
         if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
@@ -224,5 +227,5 @@ jobs:
       - name: Submit Dependencies
         uses: scalacenter/sbt-dependency-submission@v2
         with:
-          modules-ignore: sojourn_3
+          modules-ignore: sojourn-demo_3 sojourn_3
           configs-ignore: test scala-tool scala-doc-tool test-internal

@@ -13,6 +13,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
 import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
+import io.github.bbuchsbaum.sojourn.CatalogFingerprint
+import io.github.bbuchsbaum.sojourn.RequestFingerprint
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath
 import org.scalacheck.Arbitrary.arbitrary
@@ -50,7 +52,9 @@ class SpoolCodecSuite extends munit.ScalaCheckSuite:
   private val resultSchemaId: Gen[ResultSchemaId] =
     token(1, 255).map(ResultSchemaId.from(_).toOption.get)
   private val contentDigest: Gen[ContentDigest] =
-    token(1, 200).map(ContentDigest.from(_).toOption.get)
+    Gen
+      .listOfN(64, Gen.oneOf(('0' to '9') ++ ('a' to 'f')))
+      .map(chars => ContentDigest.from("sha256:" + chars.mkString).toOption.get)
   private val retrySafety: Gen[RetrySafety] =
     Gen.oneOf(RetrySafety.Unknown, RetrySafety.NoAutomaticRetry, RetrySafety.SafeForAutomaticRetry)
   private val pilotState: Gen[PilotState] =
@@ -131,6 +135,10 @@ class SpoolCodecSuite extends munit.ScalaCheckSuite:
       inputSchema <- schemaId
       resultSchema <- resultSchemaId
       safety <- retrySafety
+      requestFingerprint <- contentDigest.map(RequestFingerprint.fromDigest)
+      catalogFingerprint <- contentDigest.map(CatalogFingerprint.fromDigest)
+      releaseDigest <- contentDigest
+      manifestDigest <- contentDigest
       limits <- spoolLimits
       publishedAt <- instant
       input <- spoolInput
@@ -143,6 +151,10 @@ class SpoolCodecSuite extends munit.ScalaCheckSuite:
       inputSchema,
       resultSchema,
       safety,
+      requestFingerprint,
+      catalogFingerprint,
+      releaseDigest,
+      manifestDigest,
       limits,
       publishedAt,
       input
@@ -178,9 +190,14 @@ class SpoolCodecSuite extends munit.ScalaCheckSuite:
       resultSchema <- resultSchemaId
       pilot <- pilotId
       release <- releaseId
+      releaseDigest <- contentDigest
+      requestFingerprint <- contentDigest.map(RequestFingerprint.fromDigest)
+      catalogFingerprint <- contentDigest.map(CatalogFingerprint.fromDigest)
+      manifestDigest <- contentDigest
       safety <- retrySafety
       startedAt <- instant
-      finishedAt <- instant
+      deltaNanos <- Gen.choose(0L, 86_400_000_000_000L)
+      finishedAt = startedAt.plusNanos(deltaNanos)
       status <- statusGen
     yield SpoolResult(
       key,
@@ -191,6 +208,10 @@ class SpoolCodecSuite extends munit.ScalaCheckSuite:
       resultSchema,
       pilot,
       release,
+      releaseDigest,
+      requestFingerprint,
+      catalogFingerprint,
+      manifestDigest,
       safety,
       startedAt,
       finishedAt,
@@ -202,7 +223,11 @@ class SpoolCodecSuite extends munit.ScalaCheckSuite:
       pool <- pilotId
       site <- token(1, 100).map(SiteName.from(_).toOption.get)
       pilots <- Gen.choose(1, 512).map(PositiveInt.from("pilots", _).toOption.get)
-      minReady <- Gen.choose(1, 512).map(PositiveInt.from("minReady", _).toOption.get)
+      minReadyCount <- Gen.choose(1, 512)
+      minReady = PositiveInt
+        .from("minReady", math.min(minReadyCount, pilots.toInt))
+        .toOption
+        .get
       heartbeat <- Gen.choose(1L, 3_600_000L).map(DurationMillis.from(_).toOption.get)
       grace <- Gen.choose(1L, 3_600_000L).map(DurationMillis.from(_).toOption.get)
       limits <- spoolLimits

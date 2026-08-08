@@ -1,12 +1,14 @@
 package io.github.bbuchsbaum.sojourn.runtime.spool
 
+import scodec.bits.ByteVector
 import cats.effect.IO
 import cats.effect.Resource
 import cats.effect.kernel.Ref
 import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
-import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
 import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
 import io.github.bbuchsbaum.remoteexec.kernel.DurationMillis
 import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
@@ -27,6 +29,7 @@ import io.github.bbuchsbaum.sojourn.LeaseRevocation
 import io.github.bbuchsbaum.sojourn.LeasedPool
 import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.RemoteRef
+import io.github.bbuchsbaum.sojourn.RequestFingerprint
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SiteOperation
 import io.github.bbuchsbaum.sojourn.SitePath
@@ -41,6 +44,7 @@ import io.github.bbuchsbaum.sojourn.spool.PilotRegistration
 import io.github.bbuchsbaum.sojourn.spool.PilotState
 import io.github.bbuchsbaum.sojourn.spool.PoolManifest
 import io.github.bbuchsbaum.sojourn.spool.SpoolCodec
+import io.github.bbuchsbaum.sojourn.spool.SpoolInvocation
 import io.github.bbuchsbaum.sojourn.spool.SpoolLimits
 import io.github.bbuchsbaum.sojourn.spool.SpoolResult
 import io.github.bbuchsbaum.sojourn.spool.SpoolResultStatus
@@ -72,16 +76,16 @@ class PoolDispatcherSuite extends CatsEffectSuite:
 
   private val stringInput: InputCodec[String] = new InputCodec[String]:
     def schemaId: SchemaId = stringInputSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
 
   private val stringResult: ResultCodec[String] = new ResultCodec[String]:
     def schemaId: ResultSchemaId = stringResultSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
 
   private val echoOp: SiteOperation[String, String] =
@@ -136,6 +140,9 @@ class PoolDispatcherSuite extends CatsEffectSuite:
       ByteLimit.maximumCommandCapture,
       ByteLimit.maximumCommandCapture
     )
+
+  private val releaseDigest: ContentDigest =
+    AtomicFiles.digestOf(ByteVectors.of(Vector.empty))
 
   final private case class Env(
       root: Path,
@@ -203,6 +210,7 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           spec = spec,
           manifest = manifest,
           pilots = Vector(p0, p1),
+          releaseDigest = releaseDigest,
           initialDeadline = deadline,
           pollEvery = 25.millis,
           skewBudget = skewBudget,
@@ -230,20 +238,26 @@ class PoolDispatcherSuite extends CatsEffectSuite:
       }
     loop.timeout(bound)
 
-  /** Publish a pilot-shaped result envelope for `key` at `epoch`, naming a real stored object. */
+  /** Publish a pilot-shaped result envelope for `key` at `epoch`, naming a real stored object.
+    * Identity fields are echoed from `binding` (defaults to the pending invocation at that epoch).
+    */
   private def publishSucceeded(
       env: Env,
       key: SubmissionKey,
       epoch: AttemptEpoch,
-      payload: String
+      payload: String,
+      binding: Option[SpoolInvocation] = None
   ): IO[RemoteRef[Vector[Byte]]] =
     for
+      invocation <- binding match
+        case Some(value) => IO.pure(value.copy(attemptEpoch = epoch, key = key))
+        case None        => readPendingInvocation(env, key, epoch)
       ref <- env.store
         .putBytes(payload.getBytes(StandardCharsets.UTF_8).toVector, stringInputSchema)
         .flatMap(outcome =>
           IO.fromEither(outcome.left.map(failure => new IllegalStateException(failure.toString)))
         )
-      result = spoolResult(key, epoch, SpoolResultStatus.Succeeded(ref.path, ref.digest))
+      result = spoolResult(invocation, SpoolResultStatus.Succeeded(ref.path, ref.digest))
       _ <- env.spool
         .publishResult(result)
         .flatMap(outcome =>
@@ -251,21 +265,37 @@ class PoolDispatcherSuite extends CatsEffectSuite:
         )
     yield ref
 
-  private def spoolResult(
+  private def readPendingInvocation(
+      env: Env,
       key: SubmissionKey,
-      epoch: AttemptEpoch,
+      epoch: AttemptEpoch
+  ): IO[SpoolInvocation] =
+    for
+      pendingFile <- orRaise(env.spool.paths.pendingInvocation(KeyToken.forKey(key).value, epoch))
+      decoded <- env.spool.readInvocation(pendingFile)
+      invocation <- IO.fromEither(
+        decoded.left.map(failure => new IllegalStateException(failure.describe))
+      )
+    yield invocation
+
+  private def spoolResult(
+      invocation: SpoolInvocation,
       status: SpoolResultStatus
   ): SpoolResult =
     SpoolResult(
-      key = key,
-      attemptId = AttemptId.from("test-attempt").toOption.get,
-      attemptEpoch = epoch,
-      operation = echoOp.id,
-      operationVersion = echoOp.version,
-      resultSchema = echoOp.resultSchema,
+      key = invocation.key,
+      attemptId = invocation.attemptId,
+      attemptEpoch = invocation.attemptEpoch,
+      operation = invocation.operation,
+      operationVersion = invocation.operationVersion,
+      resultSchema = invocation.resultSchema,
       pilot = p0,
       release = WorkerReleaseId.from("test-release").toOption.get,
-      retrySafety = RetrySafety.SafeForAutomaticRetry,
+      releaseDigest = invocation.releaseDigest,
+      requestFingerprint = invocation.requestFingerprint,
+      catalogFingerprint = invocation.catalogFingerprint,
+      manifestDigest = invocation.manifestDigest,
+      retrySafety = invocation.retrySafety,
       startedAt = Instant.EPOCH,
       finishedAt = Instant.EPOCH,
       status = status
@@ -333,15 +363,23 @@ class PoolDispatcherSuite extends CatsEffectSuite:
             pendingExists(env, key, epochTwo).map(exists => if exists then Some(()) else None)
           )
           // A late e1 publication succeeds on the wire (I2 is per-epoch) but the fence keeps it
-          // from ever settling the handle.
-          staleRef <- publishSucceeded(env, key, AttemptEpoch.initial, "echo:v-stale")
+          // from ever settling the handle. Identity is copied from the live e2 invocation —
+          // e1's pending file is already gone after reclaim.
+          live <- readPendingInvocation(env, key, epochTwo)
+          staleRef <- publishSucceeded(
+            env,
+            key,
+            AttemptEpoch.initial,
+            "echo:v-stale",
+            Some(live)
+          )
           undecided <- handle.await.timeout(700.millis).attempt
           _ <- undecided match
             case Left(_: TimeoutException) => IO.unit
             case other                     =>
               IO(fail(s"a stale-epoch result must never settle the handle, observed $other"))
           // The current-epoch result settles it.
-          currentRef <- publishSucceeded(env, key, epochTwo, "echo:v-current")
+          currentRef <- publishSucceeded(env, key, epochTwo, "echo:v-current", Some(live))
           outcome <- handle.await.timeout(15.seconds)
           epochThree <- orRaise(AttemptEpoch.from(3L))
           rebumped <- pendingExists(env, key, epochThree)
@@ -366,6 +404,7 @@ class PoolDispatcherSuite extends CatsEffectSuite:
             .map(_.toOption.get)
           // Craft an envelope whose body names a DIFFERENT key, planted at this key's result path
           // (the keyToken-collision / corrupted-rename shape, race 7).
+          invocation <- readPendingInvocation(env, key, AttemptEpoch.initial)
           ref <- env.store
             .putBytes("echo:x".getBytes(StandardCharsets.UTF_8).toVector, stringInputSchema)
             .flatMap(outcome =>
@@ -374,15 +413,16 @@ class PoolDispatcherSuite extends CatsEffectSuite:
               )
             )
           forged = spoolResult(
-            foreignKey,
-            AttemptEpoch.initial,
+            invocation,
             SpoolResultStatus.Succeeded(ref.path, ref.digest)
-          )
+          ).copy(key = foreignKey)
           target <- orRaise(
             env.spool.paths.resultFile(KeyToken.forKey(key).value, AttemptEpoch.initial)
           )
           _ <- IO
-            .blocking(AtomicFiles.publishOnceBlocking(target, SpoolCodec.encodeResult(forged)))
+            .blocking(
+              AtomicFiles.publishOnceBlocking(target, ByteVectors.of(SpoolCodec.encodeResult(forged)))
+            )
             .flatMap(outcome =>
               IO.fromEither(
                 outcome.left.map(failure => new IllegalStateException(failure.toString))
@@ -402,6 +442,53 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           case TaskOutcome.Interrupted(_) => ()
           case other                      =>
             fail(s"expected Interrupted(pool-released) after release, observed $other")
+        }
+      }
+  }
+
+  test("identity mismatch: wrong requestFingerprint never settles the handle") {
+    environment(staticObserver(_ => PilotLiveness.Running))
+      .use { env =>
+        val key = freshKey("fp")
+        for
+          handle <- env.pool
+            .submit(echoOp, TaskInput.Inline("fp"), key)
+            .map(_.toOption.get)
+          invocation <- readPendingInvocation(env, key, AttemptEpoch.initial)
+          ref <- env.store
+            .putBytes("echo:fp".getBytes(StandardCharsets.UTF_8).toVector, stringInputSchema)
+            .flatMap(outcome =>
+              IO.fromEither(
+                outcome.left.map(failure => new IllegalStateException(failure.toString))
+              )
+            )
+          forgedDigest = ContentDigest
+            .from("sha256:" + ("a" * 64))
+            .toOption
+            .get
+          forged = spoolResult(
+            invocation,
+            SpoolResultStatus.Succeeded(ref.path, ref.digest)
+          ).copy(requestFingerprint = RequestFingerprint.fromDigest(forgedDigest))
+          _ <- env.spool
+            .publishResult(forged)
+            .flatMap(outcome =>
+              IO.fromEither(
+                outcome.left.map(failure => new IllegalStateException(failure.toString))
+              )
+            )
+          undecided <- handle.await.timeout(700.millis).attempt
+          _ <- undecided match
+            case Left(_: TimeoutException) => IO.unit
+            case other =>
+              IO(fail(s"fingerprint-mismatched result must never settle, observed $other"))
+        yield handle
+      }
+      .flatMap { handle =>
+        handle.await.timeout(15.seconds).map {
+          case TaskOutcome.Interrupted(_) => ()
+          case other =>
+            fail(s"expected Interrupted after release, observed $other")
         }
       }
   }

@@ -3,6 +3,8 @@ package io.github.bbuchsbaum.sojourn.tck
 import cats.effect.IO
 import cats.effect.Resource
 import fs2.Stream
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.StoreFailure
 import io.github.bbuchsbaum.sojourn.StoreStreamFailure
@@ -77,20 +79,62 @@ abstract class StoreTck extends CatsEffectSuite:
     yield assertEquals(fetched, payload)
   }
 
-  test("law S6: a decode failure is Decode, not a crash or a lie") {
+  test("law S6: schema mismatch is SchemaMismatch, not Decode or a crash") {
     val store = siteFixture().site.store
     for
       ref <- store.put("definitely-not-a-number", TckWire.stringInput).map(_.toOption.get)
-      outcome <- store.fetch(
-        io.github.bbuchsbaum.sojourn.RemoteRef[Long](ref.site, ref.path, ref.digest, ref.schema),
-        TckWire.numberResult
+      forged = io.github.bbuchsbaum.sojourn.RemoteRef.unchecked[Long](
+        ref.site,
+        ref.path,
+        ref.digest,
+        TckWire.stringInputSchema
       )
+      outcome <- store.fetch(forged, TckWire.numberResult)
+    yield outcome match
+      case Left(StoreFailure.SchemaMismatch(expected, observed)) =>
+        assertEquals(expected.value, TckWire.numberResultSchema.value)
+        assertEquals(observed, TckWire.stringInputSchema)
+      case other => fail(s"expected SchemaMismatch, observed $other")
+  }
+
+  test("law S6b: matching schema with undecodable bytes is Decode") {
+    val store = siteFixture().site.store
+    for
+      ref <- store.put("definitely-not-a-number", TckWire.stringInput).map(_.toOption.get)
+      // Same logical schema string as number would require putting under number schema; instead
+      // retag the string object as number schema so codec schema matches the ref but bytes do not.
+      forged = io.github.bbuchsbaum.sojourn.RemoteRef.unchecked[Long](
+        ref.site,
+        ref.path,
+        ref.digest,
+        SchemaId.from(TckWire.numberResultSchema.value).toOption.get
+      )
+      outcome <- store.fetch(forged, TckWire.numberResult)
     yield outcome match
       case Left(StoreFailure.Decode(_)) => ()
       case other                        => fail(s"expected Decode failure, observed $other")
   }
 
-  test("law S7: fetchStream of a corrupted object fails typed and emits nothing") {
+  test("law S6c: a foreign-site reference is ForeignSite") {
+    val store = siteFixture().site.store
+    val other = SiteName.from("other-site").toOption.get
+    for
+      ref <- store.put("foreign", TckWire.stringInput).map(_.toOption.get)
+      forged = io.github.bbuchsbaum.sojourn.RemoteRef.unchecked[String](
+        other,
+        ref.path,
+        ref.digest,
+        ref.schema
+      )
+      outcome <- store.fetch(forged, TckWire.stringResult)
+    yield outcome match
+      case Left(StoreFailure.ForeignSite(expected, observed)) =>
+        assertEquals(expected, siteFixture().site.name)
+        assertEquals(observed, other)
+      case other => fail(s"expected ForeignSite, observed $other")
+  }
+
+  test("law S7: fetchStream of a corrupted object fails typed (prefix may emit)") {
     val store = siteFixture().site.store
     val payload = Vector.tabulate(4_096)(index => (index % 199).toByte)
     for
@@ -99,22 +143,36 @@ abstract class StoreTck extends CatsEffectSuite:
         .map(_.toOption.get)
       corrupted <- siteFixture().corrupt(ref)
       _ <- IO(assume(corrupted, "backend store cannot be corrupted out-of-band"))
-      emitted <- cats.effect.kernel.Ref.of[IO, Long](0L)
       outcome <- store
         .fetchStream(ref)
-        .evalTap(_ => emitted.update(_ + 1L))
         .compile
         .drain
         .attempt
-      count <- emitted.get
     yield outcome match
       case Left(carrier: StoreStreamFailure) =>
         carrier.failure match
           case StoreFailure.DigestMismatch(_, expected, _) =>
             assertEquals(expected, ref.digest)
-            assertEquals(count, 0L)
           case other => fail(s"expected DigestMismatch inside the carrier, observed $other")
       case other => fail(s"expected a typed StoreStreamFailure, observed $other")
+  }
+
+  test("law S7b: readVerified of a corrupted object fails before returning bytes") {
+    val store = siteFixture().site.store
+    // Distinct payload from S7 so CAS does not collide with a previously corrupted object.
+    val payload = Vector.tabulate(4_096)(index => (index % 211).toByte)
+    for
+      put <- store.putStream(Stream.emits(payload).covary[IO], TckWire.stringInputSchema)
+      ref <- put match
+        case Right(value) => IO.pure(value)
+        case Left(failure) => IO.raiseError(new RuntimeException(s"putStream failed: $failure"))
+      corrupted <- siteFixture().corrupt(ref)
+      _ <- IO(assume(corrupted, "backend store cannot be corrupted out-of-band"))
+      outcome <- store.readVerified(ref)
+    yield outcome match
+      case Left(StoreFailure.DigestMismatch(_, expected, _)) =>
+        assertEquals(expected, ref.digest)
+      case other => fail(s"expected DigestMismatch, observed $other")
   }
 
   test("law S8: fetchStream of an absent object fails typed as NotFound") {
@@ -124,8 +182,8 @@ abstract class StoreTck extends CatsEffectSuite:
       ref <- store.put("stream-law-eight", TckWire.stringInput).map(_.toOption.get)
       outcome <- store
         .fetchStream(
-          io.github.bbuchsbaum.sojourn
-            .RemoteRef[String](ref.site, absent, ref.digest, ref.schema)
+          io.github.bbuchsbaum.sojourn.RemoteRef
+            .unchecked[String](ref.site, absent, ref.digest, ref.schema)
         )
         .compile
         .drain

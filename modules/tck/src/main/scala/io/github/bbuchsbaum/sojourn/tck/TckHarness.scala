@@ -1,8 +1,11 @@
 package io.github.bbuchsbaum.sojourn.tck
 
 import cats.effect.IO
+import cats.effect.Resource
 import io.github.bbuchsbaum.remoteexec.kernel.OperationId
 import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
+import io.github.bbuchsbaum.sojourn.LeasedPool
+import io.github.bbuchsbaum.sojourn.PoolCapableSite
 import io.github.bbuchsbaum.sojourn.PoolSpec
 import io.github.bbuchsbaum.sojourn.RemoteRef
 import io.github.bbuchsbaum.sojourn.Site
@@ -34,7 +37,19 @@ final case class TckHarness(
     executions: IO[Long],
     corrupt: RemoteRef[?] => IO[Boolean],
     poolSpec: PoolSpec
-)
+):
+  /** Pool laws require a [[PoolCapableSite]]; batch-only backends leave this empty. */
+  def poolSite: Option[PoolCapableSite[IO]] = site match
+    case capable: PoolCapableSite[IO] @unchecked => Some(capable)
+    case _                                       => None
+
+  def acquirePool: Resource[IO, LeasedPool[IO]] =
+    poolSite match
+      case Some(capable) => capable.pools.acquire(poolSpec)
+      case None          =>
+        Resource.raiseError[IO, LeasedPool[IO], Throwable](
+          new UnsupportedOperationException("this harness site does not implement PoolCapableSite")
+        )
 
 object TckHarness:
   /** The descriptor of an operation no conforming harness registers; submitting it must be refused

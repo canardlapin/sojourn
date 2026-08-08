@@ -6,8 +6,9 @@ import cats.effect.kernel.Ref
 import cats.effect.kernel.Resource
 import cats.syntax.all.*
 import fs2.Stream
-import fs2.concurrent.Topic
+import fs2.concurrent.SignallingRef
 import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
 import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
@@ -37,6 +38,7 @@ import io.github.bbuchsbaum.sojourn.spool.SpoolFileName
 import io.github.bbuchsbaum.sojourn.spool.SpoolInput
 import io.github.bbuchsbaum.sojourn.spool.SpoolInterruptReason
 import io.github.bbuchsbaum.sojourn.spool.SpoolInvocation
+import io.github.bbuchsbaum.sojourn.spool.SpoolCodec
 import io.github.bbuchsbaum.sojourn.spool.SpoolResult
 import io.github.bbuchsbaum.sojourn.spool.SpoolResultStatus
 
@@ -59,6 +61,8 @@ final case class PoolDispatcherConfig(
     spec: PoolSpec,
     manifest: PoolManifest,
     pilots: Vector[PilotId],
+    /** Digest of the worker release every pilot in this pool must echo on results. */
+    releaseDigest: ContentDigest,
     initialDeadline: Instant,
     pollEvery: FiniteDuration = 1.second,
     maxAutomaticRetries: Int = 1,
@@ -106,13 +110,14 @@ object PoolDispatcher:
   final private case class PoolTask(
       key: SubmissionKey,
       token: String,
+      fingerprint: RequestFingerprint,
       descriptor: OperationDescriptor,
       inputIdentity: ContentDigest,
       epoch: Ref[IO, AttemptEpoch],
       retriesUsed: Ref[IO, Int],
       status: Ref[IO, TaskStatus],
       evidence: Ref[IO, Vector[Diagnostic]],
-      outcome: Deferred[IO, TaskOutcome[Nothing]]
+      outcome: Deferred[IO, TaskResult[Nothing]]
   )
 
   final private case class PilotTrack(
@@ -140,7 +145,8 @@ object PoolDispatcher:
       val drainWritten: Ref[IO, Boolean],
       val terminal: Ref[IO, Option[LeaseEvent.Revoked]],
       val revoked: Deferred[IO, Unit],
-      val topic: Topic[IO, LeaseEvent],
+      /** Atomic lease fanout — never backpressures the scan fiber / revocation path. */
+      val snapshot: SignallingRef[IO, LeaseSnapshot],
       val resolvedTombstones: Ref[IO, Set[String]],
       val scanEvidence: Ref[IO, Vector[Diagnostic]]
   )
@@ -159,7 +165,16 @@ object PoolDispatcher:
         drainWritten <- Ref.of[IO, Boolean](false)
         terminal <- Ref.of[IO, Option[LeaseEvent.Revoked]](None)
         revoked <- Deferred[IO, Unit]
-        topic <- Topic[IO, LeaseEvent]
+        snapshot <- SignallingRef[IO].of(
+          LeaseSnapshot(
+            version = 0L,
+            deadline = initialDeadline,
+            ready = PilotCount.zero,
+            granted = false,
+            terminal = None,
+            lastTransition = None
+          )
+        )
         resolvedTombstones <- Ref.of[IO, Set[String]](Set.empty)
         scanEvidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
       yield new State(
@@ -175,7 +190,7 @@ object PoolDispatcher:
         drainWritten,
         terminal,
         revoked,
-        topic,
+        snapshot,
         resolvedTombstones,
         scanEvidence
       )
@@ -200,43 +215,46 @@ object PoolDispatcher:
 
     private val heartbeatEvery: FiniteDuration = config.manifest.heartbeatEvery.value.millis
     private val drainGraceMillis: Long = config.spec.drainGrace.value
+    private val catalogFingerprint: CatalogFingerprint = registry.catalog.fingerprint
+    private val manifestDigest: ContentDigest =
+      AtomicFiles.digestOf(ByteVectors.of(SpoolCodec.encodeManifest(config.manifest)))
 
     // ─── LeaseState ──────────────────────────────────────────────────────────
 
     val lease: LeaseState[IO] = new LeaseState[IO]:
-      def deadline: IO[Instant] = state.deadline.get
-      def ready: IO[PilotCount] = state.ready.get
+      def deadline: IO[Instant] = state.snapshot.get.map(_.deadline)
+      def ready: IO[PilotCount] = state.snapshot.get.map(_.ready)
+      def current: IO[LeaseSnapshot] = state.snapshot.get
       def onRevoked: IO[Unit] = state.revoked.get
 
+      def changes: Stream[IO, LeaseSnapshot] =
+        state.snapshot.discrete.takeThrough(snapshot => !snapshot.isRevoked)
+
       def events: Stream[IO, LeaseEvent] =
-        Stream
-          .eval((state.terminal.get, state.granted.get, state.ready.get).tupled)
-          .flatMap { case (terminalEvent, grantedNow, readyNow) =>
-            terminalEvent match
-              case Some(event) => Stream.emit(event)
-              case None        =>
-                // Late subscribers replay the current grant so "first Granted event" is
-                // meaningful whenever the lease is already at its floor; the terminal event is
-                // re-checked after the topic closes so a Revoked published between subscription
-                // decisions is never lost.
-                val snapshot =
-                  if grantedNow then Stream.emit(LeaseEvent.Granted(readyNow))
-                  else Stream.empty
-                val live = state.topic.subscribe(64)
-                val closing =
-                  Stream.eval(state.terminal.get).flatMap(o => Stream.emits(o.toList))
-                (snapshot ++ live ++ closing)
-                  .takeThrough {
-                    case LeaseEvent.Revoked(_) => false
-                    case LeaseEvent.Granted(_) | LeaseEvent.Degraded(_, _) | LeaseEvent.Renewing =>
-                      true
-                  }
-                  .filterWithPrevious((previous, next) => !(isGranted(previous) && isGranted(next)))
-          }
+        // Late subscribers: if already revoked, emit the terminal once and complete. If already
+        // granted, replay Granted from the atomic snapshot, then follow live updates until revoke.
+        // Never `drop(1)` past a terminal snapshot — that would leave the stream waiting forever.
+        Stream.eval(state.snapshot.get).flatMap { snap =>
+          snap.terminal match
+            case Some(revoked) => Stream.emit(revoked: LeaseEvent)
+            case None          =>
+              val replay =
+                if snap.granted then Stream.emit(LeaseEvent.Granted(snap.ready))
+                else Stream.empty
+              val live = state.snapshot.discrete
+                .drop(1)
+                .takeThrough(snapshot => !snapshot.isRevoked)
+                .map(_.lastTransition)
+                .unNone
+              (replay ++ live).filterWithPrevious((previous, next) =>
+                !(isGranted(previous) && isGranted(next))
+              )
+        }
 
     private def isGranted(event: LeaseEvent): Boolean = event match
       case LeaseEvent.Granted(_)                                                   => true
       case LeaseEvent.Degraded(_, _) | LeaseEvent.Renewing | LeaseEvent.Revoked(_) => false
+      case LeaseEvent.BelowFloor(_, _) | LeaseEvent.Recovered(_)                   => false
 
     // ─── submission ──────────────────────────────────────────────────────────
 
@@ -283,7 +301,7 @@ object PoolDispatcher:
             .map(failure =>
               OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}")
             )
-            .map(bytes => PreparedInput.Carried(bytes, AtomicFiles.digestOf(bytes)))
+            .map(bytes => PreparedInput.Carried(ByteVectors.toVector(bytes), AtomicFiles.digestOf(bytes)))
         case TaskInput.Stored(ref) =>
           Right(PreparedInput.Referenced(ref.path, ref.digest))
 
@@ -295,22 +313,26 @@ object PoolDispatcher:
       val identity = prepared match
         case PreparedInput.Carried(_, digest)    => digest
         case PreparedInput.Referenced(_, digest) => digest
-      state.closed.get.flatMap { isClosed =>
-        if isClosed then IO.pure(Left(SubmitRejection.Closed))
-        else
-          state.tasks.get.map(_.get(key)).flatMap {
-            case Some(existing)
-                if existing.descriptor == op.descriptor && existing.inputIdentity == identity =>
-              IO.pure(Right(taskHandle[O](existing)))
-            case Some(_) => IO.pure(Left(SubmitRejection.Conflict(key)))
-            case None    => create(op, prepared, identity, key)
-          }
+      val proposed = RequestFingerprint.compute(op, identity)
+      IO.uncancelable { _ =>
+        state.closed.get.flatMap { isClosed =>
+          if isClosed then IO.pure(Left(SubmitRejection.Closed))
+          else
+            state.tasks.get.map(_.get(key)).flatMap {
+              case Some(existing) if existing.fingerprint == proposed =>
+                IO.pure(Right(taskHandle[O](existing)))
+              case Some(existing) =>
+                IO.pure(Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed)))
+              case None => create(op, prepared, identity, proposed, key)
+            }
+        }
       }
 
     private def create[I, O](
         op: SiteOperation[I, O],
         prepared: PreparedInput,
         identity: ContentDigest,
+        proposed: RequestFingerprint,
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
       val token = KeyToken.forKey(key).value
@@ -327,10 +349,11 @@ object PoolDispatcher:
                 TaskStatus(TaskPhase.Queued, Freshness.Current(submittedAt))
               )
               evidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
-              deferred <- Deferred[IO, TaskOutcome[Nothing]]
+              deferred <- Deferred[IO, TaskResult[Nothing]]
               candidate = PoolTask(
                 key,
                 token,
+                proposed,
                 op.descriptor,
                 identity,
                 epoch,
@@ -341,12 +364,11 @@ object PoolDispatcher:
               )
               decision <- state.tasks.modify { current =>
                 current.get(key) match
-                  case Some(existing)
-                      if existing.descriptor == op.descriptor &&
-                        existing.inputIdentity == identity =>
+                  case Some(existing) if existing.fingerprint == proposed =>
                     (current, Right(existing))
-                  case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
-                  case None    => (current.updated(key, candidate), Right(candidate))
+                  case Some(existing) =>
+                    (current, Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed)))
+                  case None => (current.updated(key, candidate), Right(candidate))
               }
               handle <- decision match
                 case Left(rejection) => IO.pure(Left(rejection))
@@ -396,6 +418,10 @@ object PoolDispatcher:
             op.inputSchema,
             op.resultSchema,
             op.retrySafety,
+            task.fingerprint,
+            catalogFingerprint,
+            config.releaseDigest,
+            manifestDigest,
             config.manifest.limits,
             submittedAt,
             spoolInput
@@ -448,7 +474,10 @@ object PoolDispatcher:
       new TaskHandle[IO, O]:
         def key: SubmissionKey = task.key
         def status: IO[TaskStatus] = task.status.get
-        def await: IO[TaskOutcome[O]] = task.outcome.get.map(outcome => outcome: TaskOutcome[O])
+        def await: IO[TaskOutcome[O]] =
+          task.outcome.get.map(result => result.outcome: TaskOutcome[O])
+        def awaitResult: IO[TaskResult[O]] =
+          task.outcome.get.map(result => TaskResult(result.outcome: TaskOutcome[O], result.report))
         def cancel: IO[Unit] = cancelTask(task)
 
     /** Best-effort cancellation: an invocation still in `pending/` is swept (it provably never ran
@@ -533,9 +562,7 @@ object PoolDispatcher:
                 case Left(failure) =>
                   (
                     None,
-                    Some(
-                      Diagnostic("pilot-registration-unreadable", failure.describe)
-                    )
+                    Some(Diagnostic("pilot-registration-unreadable", failure.describe))
                   )
               }
           heartbeat <- spool.readHeartbeat(pilot).map {
@@ -549,20 +576,31 @@ object PoolDispatcher:
           liveness <- observer.observe(pilot)
           (registrationValue, registrationFailure) = registration
           (heartbeatValue, heartbeatFailure) = heartbeat
-          arrival = HeartbeatStaleness.observe(
+          observed = HeartbeatStaleness.observe(
             previous.arrival,
             heartbeatValue.fold(-1L)(_.sequence),
             tick
           )
+          arrival = observed.arrival
+          regressionEvidence = observed match
+            case HeartbeatStaleness.ObserveResult.Regressed(_, previousSeq, observedSeq) =>
+              Some(
+                Diagnostic(
+                  "pilot-heartbeat-sequence-regressed",
+                  s"${pilot.value}: sequence $previousSeq → $observedSeq; staleness window retained"
+                )
+              )
+            case _ => None
+          _ <- regressionEvidence.traverse_(recordScan)
           _ <- state.pilots.update(
             _.updated(
               pilot,
               PilotTrack(
-                registrationValue,
+                registrationValue.orElse(previous.registration),
                 heartbeatValue,
                 Some(arrival),
                 liveness,
-                registrationFailure.orElse(heartbeatFailure)
+                registrationFailure.orElse(heartbeatFailure).orElse(regressionEvidence)
               )
             )
           )
@@ -885,47 +923,81 @@ object PoolDispatcher:
 
     /** Settle a handle from a verified, epoch-current envelope. A Succeeded envelope additionally
       * requires the named store object to verify against its digest before the handle settles.
+      * Identity fields on the envelope must match the admission binding; a mismatch is retained as
+      * evidence and never settles the handle.
       */
     private def settleFromResult(task: PoolTask, result: SpoolResult): IO[Unit] =
-      result.status match
-        case SpoolResultStatus.Succeeded(path, digest) =>
-          store.readBytes(path, Some(digest)).flatMap {
-            case Left(storeFailure) =>
-              recordTaskOnce(
+      bindingMismatch(task, result) match
+        case Some(detail) =>
+          recordTaskOnce(task, Diagnostic("result-identity-mismatch", detail))
+        case None =>
+          result.status match
+            case SpoolResultStatus.Succeeded(path, digest) =>
+              store.readBytes(path, Some(digest)).flatMap {
+                case Left(storeFailure) =>
+                  recordTaskOnce(
+                    task,
+                    Diagnostic(
+                      "result-object-unverified",
+                      ("settle blocked" +: SpoolEvidence.storeFailureCodes(storeFailure))
+                        .mkString(";")
+                    )
+                  )
+                case Right(_) =>
+                  SchemaId.from(task.descriptor.resultSchema.value) match
+                    case Left(failure) =>
+                      recordTaskOnce(task, Diagnostic("result-schema-invalid", failure.reason))
+                    case Right(schema) =>
+                      settle(
+                        task,
+                        TaskOutcome.Succeeded(
+                          RemoteRef[Nothing](config.site, path, digest, schema)
+                        )
+                      )
+              }
+            case SpoolResultStatus.Failed(code, message) =>
+              // The observed message travels as a confirmed contributor — WorkerFailure carries
+              // only the stable code.
+              settleFailed(
+                task,
+                FailureCause.WorkerFailure(code),
+                Vector(FailureCause.ProgramFailed(None, Vector(message)))
+              )
+            case SpoolResultStatus.Interrupted(reason, detail) =>
+              settleInterrupted(
                 task,
                 Diagnostic(
-                  "result-object-unverified",
-                  ("settle blocked" +: SpoolEvidence.storeFailureCodes(storeFailure)).mkString(";")
-                )
+                  "pilot-interrupted",
+                  s"${interruptReasonText(reason)}: $detail (pilot ${result.pilot.value})"
+                ),
+                Vector.empty
               )
-            case Right(_) =>
-              SchemaId.from(task.descriptor.resultSchema.value) match
-                case Left(failure) =>
-                  recordTaskOnce(task, Diagnostic("result-schema-invalid", failure.reason))
-                case Right(schema) =>
-                  settle(
-                    task,
-                    TaskOutcome.Succeeded(RemoteRef[Nothing](config.site, path, digest, schema))
-                  )
-          }
-        case SpoolResultStatus.Failed(code, message) =>
-          // The observed message travels as a confirmed contributor — WorkerFailure carries
-          // only the stable code.
-          settleFailed(
-            task,
-            FailureCause.WorkerFailure(code),
-            Vector(FailureCause.ProgramFailed(None, Vector(message)))
-          )
-        case SpoolResultStatus.Interrupted(reason, detail) =>
-          settleInterrupted(
-            task,
-            Diagnostic(
-              "pilot-interrupted",
-              s"${interruptReasonText(reason)}: $detail (pilot ${result.pilot.value})"
-            ),
-            Vector.empty
-          )
 
+    private def bindingMismatch(task: PoolTask, result: SpoolResult): Option[String] =
+      val checks = Vector(
+        Option.when(result.requestFingerprint != task.fingerprint)(
+          s"requestFingerprint expected ${task.fingerprint.value} observed ${result.requestFingerprint.value}"
+        ),
+        Option.when(result.catalogFingerprint != catalogFingerprint)(
+          s"catalogFingerprint expected ${catalogFingerprint.value} observed ${result.catalogFingerprint.value}"
+        ),
+        Option.when(result.manifestDigest != manifestDigest)(
+          s"manifestDigest expected ${manifestDigest.value} observed ${result.manifestDigest.value}"
+        ),
+        Option.when(result.releaseDigest != config.releaseDigest)(
+          s"releaseDigest expected ${config.releaseDigest.value} observed ${result.releaseDigest.value}"
+        ),
+        Option.when(result.operation != task.descriptor.id)(
+          s"operation expected ${task.descriptor.id.value} observed ${result.operation.value}"
+        ),
+        Option.when(result.operationVersion != task.descriptor.version)(
+          s"operationVersion expected ${task.descriptor.version.value} observed ${result.operationVersion.value}"
+        ),
+        Option.when(result.resultSchema != task.descriptor.resultSchema)(
+          s"resultSchema expected ${task.descriptor.resultSchema.value} observed ${result.resultSchema.value}"
+        )
+      ).flatten
+      Option.when(checks.nonEmpty)(checks.mkString("; "))
     // ─── phase derivation ────────────────────────────────────────────────────
 
     private def phaseScan(tick: Instant): IO[Unit] =
@@ -957,40 +1029,43 @@ object PoolDispatcher:
                 val owner = claimOwners.get(name)
                 val holderTrack = owner.map(pilot => tracks.getOrElse(pilot, PilotTrack.initial))
                 task.status.get.flatMap { previous =>
-                  val phase =
-                    if pendingNames.contains(name) then TaskPhase.Queued
-                    else
-                      owner match
-                        case Some(pilot) =>
-                          val fresh = holderTrack.exists(track => !isStale(track, tick))
-                          val claimsIt = holderTrack.exists(track =>
-                            track.heartbeat.exists(beat =>
-                              beat.claimed.contains(SpoolClaim(task.key, epoch))
+                  if previous.phase == TaskPhase.Settled then IO.unit
+                  else
+                    val phase =
+                      if pendingNames.contains(name) then TaskPhase.Queued
+                      else
+                        owner match
+                          case Some(pilot) =>
+                            val fresh = holderTrack.exists(track => !isStale(track, tick))
+                            val claimsIt = holderTrack.exists(track =>
+                              track.heartbeat.exists(beat =>
+                                beat.claimed.contains(SpoolClaim(task.key, epoch))
+                              )
+                            )
+                            if fresh && claimsIt then TaskPhase.Running else TaskPhase.Dispatched
+                          case None => previous.phase
+                    val nextPhase = TaskPhase.advance(previous.phase, phase)
+                    val holderUnknown = holderTrack.exists(track =>
+                      track.liveness match
+                        case PilotLiveness.Unobservable(_)                     => isStale(track, tick)
+                        case PilotLiveness.Running | PilotLiveness.Terminal(_) => false
+                    )
+                    val freshness =
+                      if scanFailures.nonEmpty then
+                        Freshness.Unknown(tick, diags(scanFailures.head, scanFailures.tail))
+                      else if holderUnknown then
+                        Freshness.Unknown(
+                          tick,
+                          diags(
+                            Diagnostic(
+                              "pilot-unobservable-stale",
+                              "the claim holder is heartbeat-stale and its backend allocation " +
+                                "cannot currently be observed (E5 hold)"
                             )
                           )
-                          if fresh && claimsIt then TaskPhase.Running else TaskPhase.Dispatched
-                        case None => previous.phase
-                  val holderUnknown = holderTrack.exists(track =>
-                    track.liveness match
-                      case PilotLiveness.Unobservable(_)                     => isStale(track, tick)
-                      case PilotLiveness.Running | PilotLiveness.Terminal(_) => false
-                  )
-                  val freshness =
-                    if scanFailures.nonEmpty then
-                      Freshness.Unknown(tick, diags(scanFailures.head, scanFailures.tail))
-                    else if holderUnknown then
-                      Freshness.Unknown(
-                        tick,
-                        diags(
-                          Diagnostic(
-                            "pilot-unobservable-stale",
-                            "the claim holder is heartbeat-stale and its backend allocation " +
-                              "cannot currently be observed (E5 hold)"
-                          )
                         )
-                      )
-                    else Freshness.Current(tick)
-                  task.status.set(TaskStatus(phase, freshness))
+                      else Freshness.Current(tick)
+                    task.status.set(TaskStatus(nextPhase, freshness))
                 }
           }
         }
@@ -1352,8 +1427,26 @@ object PoolDispatcher:
 
     // ─── event plumbing ──────────────────────────────────────────────────────
 
+    /** Publish a lease transition by atomically advancing the versioned snapshot. SignallingRef
+      * fanout does not backpressure the scan fiber or the release finalizer.
+      */
     private def publish(event: LeaseEvent): IO[Unit] =
-      state.topic.publish1(event).void
+      for
+        deadline <- state.deadline.get
+        ready <- state.ready.get
+        granted <- state.granted.get
+        terminal <- state.terminal.get
+        _ <- state.snapshot.update { previous =>
+          LeaseSnapshot(
+            version = previous.version + 1L,
+            deadline = deadline,
+            ready = ready,
+            granted = granted,
+            terminal = terminal,
+            lastTransition = Some(event)
+          )
+        }
+      yield ()
 
     private def claimTerminal(event: LeaseEvent.Revoked): IO[Boolean] =
       state.terminal.modify {
@@ -1362,7 +1455,7 @@ object PoolDispatcher:
       }
 
     private def emitTerminal(event: LeaseEvent.Revoked): IO[Unit] =
-      publish(event) *> state.topic.close.void *> state.revoked.complete(()).void
+      publish(event) *> state.revoked.complete(()).void
 
     // ─── small helpers ───────────────────────────────────────────────────────
 
@@ -1416,12 +1509,24 @@ object PoolDispatcher:
       )
 
     private def settle(task: PoolTask, outcome: TaskOutcome[Nothing]): IO[Unit] =
-      task.outcome.complete(outcome).flatMap {
-        case false => IO.unit
-        case true  =>
-          now.flatMap(tick =>
-            task.status.set(TaskStatus(TaskPhase.Settled, Freshness.Current(tick)))
+      task.evidence.get.flatMap { evidence =>
+        val result = TaskResult(
+          outcome,
+          TaskReport.fromOutcome(
+            outcome,
+            evidence = evidence,
+            requestFingerprint = Some(task.fingerprint),
+            catalogFingerprint = Some(catalogFingerprint),
+            inputDigest = Some(task.inputIdentity)
           )
+        )
+        task.outcome.complete(result).flatMap {
+          case false => IO.unit
+          case true  =>
+            now.flatMap(tick =>
+              task.status.set(TaskStatus(TaskPhase.Settled, Freshness.Current(tick)))
+            )
+        }
       }
 
     private def recordTask(task: PoolTask, diagnostic: Diagnostic): IO[Unit] =

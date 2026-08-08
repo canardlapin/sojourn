@@ -5,6 +5,7 @@ import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
 import io.github.bbuchsbaum.remoteexec.kernel.ResultCodecFailure
 import io.github.bbuchsbaum.remoteexec.kernel.ResultSchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import scodec.bits.ByteVector
 
 import java.nio.charset.StandardCharsets
 
@@ -21,16 +22,16 @@ object TckWire:
 
   val stringInput: InputCodec[String] = new InputCodec[String]:
     def schemaId: SchemaId = stringInputSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
 
   val stringResult: ResultCodec[String] = new ResultCodec[String]:
     def schemaId: ResultSchemaId = stringResultSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
 
   /** Decodes only ASCII digit strings — the deliberately narrow codec the decode-failure law feeds
@@ -38,8 +39,8 @@ object TckWire:
     */
   val numberResult: ResultCodec[Long] = new ResultCodec[Long]:
     def schemaId: ResultSchemaId = numberResultSchema
-    def encode(value: Long): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.toString.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, Long] =
+    def encode(value: Long): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.toString.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, Long] =
       val text = new String(bytes.toArray, StandardCharsets.UTF_8)
       text.toLongOption.toRight(ResultCodecFailure("not-a-number", s"'$text' is not a number"))

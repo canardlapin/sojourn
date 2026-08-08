@@ -7,12 +7,15 @@ import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
 import io.github.bbuchsbaum.remoteexec.kernel.OperationId
 import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
 import io.github.bbuchsbaum.remoteexec.kernel.ResultSchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
 import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.sojourn.CatalogFingerprint
+import io.github.bbuchsbaum.sojourn.RequestFingerprint
 import io.github.bbuchsbaum.sojourn.runtime.KeyToken
 import io.github.bbuchsbaum.sojourn.spool.PilotId
 import io.github.bbuchsbaum.sojourn.spool.SpoolInput
@@ -41,6 +44,9 @@ class SpoolClaimRaceSuite extends CatsEffectSuite:
       }
     )
 
+  private def digest(suffix: Char): ContentDigest =
+    ContentDigest.from(s"sha256:${"0" * 63}$suffix").toOption.get
+
   private def invocation(key: SubmissionKey): SpoolInvocation =
     SpoolInvocation(
       key = key,
@@ -51,6 +57,10 @@ class SpoolClaimRaceSuite extends CatsEffectSuite:
       inputSchema = SchemaId.from("sojourn.test.string.v1").toOption.get,
       resultSchema = ResultSchemaId.from("sojourn.test.string.v1").toOption.get,
       retrySafety = RetrySafety.Unknown,
+      requestFingerprint = RequestFingerprint.fromDigest(digest('1')),
+      catalogFingerprint = CatalogFingerprint.fromDigest(digest('2')),
+      releaseDigest = digest('3'),
+      manifestDigest = digest('4'),
       limits = SpoolLimits(
         ByteLimit.maximumCommandCapture,
         ByteLimit.maximumCommandCapture,

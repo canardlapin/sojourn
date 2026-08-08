@@ -1,5 +1,7 @@
 package io.github.bbuchsbaum.sojourn.tck
 
+import scodec.bits.ByteVector
+
 import org.scalacheck.Gen
 import org.scalacheck.Prop.forAll
 
@@ -29,18 +31,18 @@ class TckWireSuite extends munit.ScalaCheckSuite:
   }
 
   test("numberResult refuses non-numeric bytes as a typed failure") {
-    val bytes = "forty-two".getBytes(StandardCharsets.UTF_8).toVector
+    val bytes = ByteVector.view("forty-two".getBytes(StandardCharsets.UTF_8))
     assert(TckWire.numberResult.decode(bytes).left.exists(_.code == "not-a-number"))
   }
 
   test("canonical bytes are pinned") {
     assertEquals(
       TckWire.stringInput.encode("hello π").toOption.get,
-      "hello π".getBytes(StandardCharsets.UTF_8).toVector
+      ByteVector.view("hello π".getBytes(StandardCharsets.UTF_8))
     )
     assertEquals(
       TckWire.numberResult.encode(-42L).toOption.get,
-      "-42".getBytes(StandardCharsets.UTF_8).toVector
+      ByteVector.view("-42".getBytes(StandardCharsets.UTF_8))
     )
     assertEquals(TckWire.stringInputSchema.value, "sojourn.tck.string.v1")
     assertEquals(TckWire.stringResultSchema.value, "sojourn.tck.string.v1")

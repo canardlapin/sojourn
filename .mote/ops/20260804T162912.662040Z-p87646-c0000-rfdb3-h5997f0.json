@@ -1,0 +1,1 @@
+{"actor":"sojourn-1-0","entity":"bd-01KZ6RM18HG1F36H4ZCMKY2A9C","kind":"note","note_kind":"note","op":"20260804T162912.662040Z-p87646-c0000-rfdb3-h5997f0","text":"Open→Sealed publisher + claim tokens; PublisherClosed; race tests (idempotent finish, concurrent finish, late write)","ts":"2026-08-04T16:29:12.662040Z","v":1}

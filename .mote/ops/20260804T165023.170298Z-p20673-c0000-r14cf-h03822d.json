@@ -1,0 +1,1 @@
+{"actor":"sojourn-1-0","entity":"bd-01KZ6T7WX7CPW5ZTPJB0E4VAXV","kind":"note","note_kind":"note","op":"20260804T165023.170298Z-p20673-c0000-r14cf-h03822d","text":"LeaseSnapshot + SignallingRef fanout; LeaseState.current/changes; awaitGranted reads atomic snapshot; Topic removed","ts":"2026-08-04T16:50:23.170298Z","v":1}

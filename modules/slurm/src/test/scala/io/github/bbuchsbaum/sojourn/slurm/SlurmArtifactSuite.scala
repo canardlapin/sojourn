@@ -3,12 +3,13 @@ package io.github.bbuchsbaum.sojourn.slurm
 import cats.effect.IO
 import cats.effect.Resource
 import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
 import io.github.bbuchsbaum.remoteexec.kernel.OperationId
 import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
-import io.github.bbuchsbaum.scalaslurm.core.OutputEntry
-import io.github.bbuchsbaum.scalaslurm.core.OutputManifest
-import io.github.bbuchsbaum.scalaslurm.core.RelativeOutputPath
+import io.github.bbuchsbaum.slurm4s.core.OutputEntry
+import io.github.bbuchsbaum.slurm4s.core.OutputManifest
+import io.github.bbuchsbaum.slurm4s.core.RelativeOutputPath
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.tck.TckWire
@@ -25,7 +26,7 @@ class SlurmArtifactSuite extends munit.CatsEffectSuite:
   private val declarations =
     ArtifactDeclarations.from(Vector(declaration)).toOption.get
 
-  test("Sojourn declarations lower into the scala-slurm structured result contract") {
+  test("Sojourn declarations lower into the slurm4s structured result contract") {
     val operation = SiteOperation(
       OperationId.from("slurm.artifact.contract").toOption.get,
       OperationVersion.from("1").toOption.get,
@@ -113,7 +114,7 @@ class SlurmArtifactSuite extends munit.CatsEffectSuite:
       .from(
         RelativeOutputPath.from(path.value).toOption.get,
         bytes.size.toLong,
-        AtomicFiles.digestOf(bytes)
+        AtomicFiles.digestOf(ByteVectors.of(bytes))
       )
       .toOption
       .get

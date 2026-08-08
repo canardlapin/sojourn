@@ -4,13 +4,13 @@ Status: accepted
 
 ## Decision
 
-Sojourn and scala-slurm are compositional layers, not competing scheduler libraries.
+Sojourn and slurm4s are compositional layers, not competing scheduler libraries.
 
 | Owner | Capability |
 | --- | --- |
 | `remote-exec-kernel` | Provider-neutral identities, operation descriptors, codecs, diagnostics, freshness, retry declarations, and atomic-file publication |
-| `scala-slurm` | Slurm requests and observations, local CLI and SSH-agent transports, durable submission/cancellation journal, attempt epochs, registered-worker staging, and verified result attachment |
-| `sojourn` | Scheduler-neutral `Site`/`TaskRunner`/`TaskHandle`/store semantics, operation registry, reference-passing results, and assembly of scala-slurm capabilities into a site |
+| `slurm4s` | Slurm requests and observations, local CLI and SSH-agent transports, durable submission/cancellation journal, attempt epochs, registered-worker staging, and verified result attachment |
+| `sojourn` | Scheduler-neutral `Site`/`TaskRunner`/`TaskHandle`/store semantics, operation registry, reference-passing results, and assembly of slurm4s capabilities into a site |
 
 The overlap that previously existed in identifiers, operation descriptors, atomic files, result
 decoding, idempotency, and lifecycle tracking has one owner after this change.

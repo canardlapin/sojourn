@@ -5,10 +5,10 @@ Status: accepted (2026-07-24)
 Sojourn's pure contracts and filesystem mechanics must not be owned by a scheduler backend.
 `sojourn-core` therefore depends only on `remote-exec-kernel` for validated identifiers, codecs,
 diagnostics, freshness, retry provenance, failure reports, and content identity. It has no
-dependency on any scala-slurm artifact.
+dependency on any slurm4s artifact.
 
 `sojourn-runtime` imports atomic publication directly from the same kernel. It may still compose
-scala-slurm protocol and worker execution at the executable boundary, but worker policy does not
+slurm4s protocol and worker execution at the executable boundary, but worker policy does not
 own the filesystem primitive. Local and Slurm sites remain peers implementing Sojourn's site
 surface.
 

@@ -2,6 +2,7 @@ package io.github.bbuchsbaum.sojourn.runtime
 
 import cats.effect.kernel.Sync
 import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 
 import java.nio.file.Files as JFiles
 import java.nio.file.Path
@@ -54,7 +55,7 @@ object SitePreflight:
 
     // fsync-forced exclusive write (probes CREATE_NEW + force(true) together).
     def firstWrite: Either[PreflightFailure, Unit] =
-      AtomicFiles.writeNewBlocking(probeSource, payload) match
+      AtomicFiles.writeNewBlocking(probeSource, ByteVectors.of(payload)) match
         case Right(())                                               => Right(())
         case Left(AtomicFiles.WriteFailure.AtomicMoveUnavailable(_)) =>
           Left(PreflightFailure.AtomicRenameUnsupported("probe write could not rename"))
@@ -62,7 +63,7 @@ object SitePreflight:
 
     // CREATE_NEW exclusivity: a second write-once of the same target must refuse.
     def exclusivity: Either[PreflightFailure, Unit] =
-      AtomicFiles.writeNewBlocking(probeSource, payload) match
+      AtomicFiles.writeNewBlocking(probeSource, ByteVectors.of(payload)) match
         case Left(AtomicFiles.WriteFailure.TargetExists(_)) => Right(())
         case other                                          =>
           Left(

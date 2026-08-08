@@ -12,15 +12,51 @@ ThisBuild / tlJdkRelease := Some(17)
 ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17"), JavaSpec.temurin("21"))
 ThisBuild / tlCiScalafmtCheck := true
 ThisBuild / tlCiHeaderCheck := false
-ThisBuild / scalacOptions += "-Xmax-inlines:64"
+ThisBuild / githubWorkflowBuild += WorkflowStep.Sbt(
+  List("checkModuleBoundaries"),
+  name = Some("Check module boundaries")
+)
+ThisBuild / scalacOptions ++= Seq(
+  "-Xmax-inlines:64",
+  "-language:strictEquality",
+  "-Wunused:imports",
+  "-Wunused:locals",
+  "-Wunused:privates",
+  "-Wvalue-discard",
+  "-Wnonunit-statement"
+)
 ThisBuild / Test / fork := true
 ThisBuild / dependencyOverrides += Libraries.munit
+
+/** Fail if scheduler artifacts leak into modules that must stay provider-neutral. */
+lazy val checkModuleBoundaries = taskKey[Unit](
+  "Verify sojourn-core and sojourn-tck do not depend on slurm4s artifacts"
+)
+
+def assertNoSlurm4s(moduleLabel: String, report: UpdateReport): Unit = {
+  val forbidden = report.allModules.filter { m =>
+    m.organization == "io.github.bbuchsbaum" && m.name.startsWith("slurm4s-")
+  }
+  if (forbidden.nonEmpty)
+    sys.error(
+      s"$moduleLabel must not depend on slurm4s artifacts; found: " +
+        forbidden.map(m => s"${m.name}:${m.revision}").mkString(", ")
+    )
+}
 
 lazy val root = project
   .in(file("."))
   .enablePlugins(NoPublishPlugin)
-  .aggregate(core, runtime, local, slurm, dsl, tck, demo)
-  .settings(name := "sojourn")
+  .aggregate(core, worker, runtime, local, slurm, dsl, all, tck, demo)
+  .settings(
+    name := "sojourn",
+    checkModuleBoundaries := {
+      (core / checkModuleBoundaries).value
+      (worker / checkModuleBoundaries).value
+      (dsl / checkModuleBoundaries).value
+      (tck / checkModuleBoundaries).value
+    }
+  )
 
 // The scheduler-neutral kernel: typed site/lease/task surface plus the spool
 // wire protocol. Its only cross-repository dependency is the provider-neutral
@@ -40,23 +76,38 @@ lazy val core = project
       Libraries.munitCatsEffect % Test,
       Libraries.munitScalaCheck % Test,
       Libraries.scalaCheck % Test
-    )
+    ),
+    checkModuleBoundaries := assertNoSlurm4s("sojourn-core", update.value)
   )
 
-// Scheduler-neutral effectful machinery: the content-addressed shared-filesystem
-// store, the operation registry, the one-binary entry point (one-shot batch mode
-// now; pilot mode arrives with the spool runtime), site preflight probes, and
-// release staging. Atomic publication comes directly from the provider-neutral
-// remote-exec kernel.
+// Program / operation registry execution — backend-neutral. Must not depend on slurm4s.
+lazy val worker = project
+  .in(file("modules/worker"))
+  .dependsOn(core)
+  .settings(
+    name := "sojourn-worker",
+    libraryDependencies ++= Seq(
+      Libraries.remoteExecKernel,
+      Libraries.catsEffect,
+      Libraries.fs2Core,
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test
+    ),
+    checkModuleBoundaries := assertNoSlurm4s("sojourn-worker", update.value)
+  )
+
+// Scheduler-neutral effectful machinery: store, spool, preflight. Still hosts
+// SojournEntryPoint/WorkerBridge (slurm4s-worker) until those move fully into
+// sojourn-slurm; registry types re-export from sojourn-worker.
 lazy val runtime = project
   .in(file("modules/runtime"))
-  .dependsOn(core)
+  .dependsOn(core, worker)
   .settings(
     name := "sojourn-runtime",
     libraryDependencies ++= Seq(
       Libraries.remoteExecKernel,
-      Libraries.scalaSlurmWorker,
-      Libraries.scalaSlurmProtocol,
+      Libraries.slurm4sWorker,
+      Libraries.slurm4sProtocol,
       Libraries.catsEffect,
       Libraries.fs2Core,
       Libraries.fs2Io,
@@ -68,9 +119,7 @@ lazy val runtime = project
     )
   )
 
-// The scheduler-free backend: batch execution on supervised fibers through the
-// real envelope-publication path over a local filesystem store. Proves the SPI
-// is implementable without a scheduler and gives the TCK a fast target.
+// The scheduler-free backend: PoolCapableSite.
 lazy val local = project
   .in(file("modules/local"))
   .dependsOn(runtime, tck % "test->compile")
@@ -82,43 +131,48 @@ lazy val local = project
     )
   )
 
-// The exemplary Slurm backend: batch execution composed from scala-slurm's
-// local CLI scheduler, durable managed control, registered-task staging, and
-// strict result attachment, over a shared-filesystem store. IO-shaped for now:
-// the upstream worker pipeline is IO-hardcoded (recorded wart), and this module
-// commits to it rather than pretending polymorphism it cannot honor.
+// Exemplary Slurm backend — Site (batch) today; PoolCapableSite before 1.0.0.
 lazy val slurm = project
   .in(file("modules/slurm"))
   .dependsOn(runtime, tck % "test->compile")
   .settings(
     name := "sojourn-slurm",
     libraryDependencies ++= Seq(
-      Libraries.scalaSlurmManaged,
-      Libraries.scalaSlurmLocal,
-      Libraries.scalaSlurmSsh,
+      Libraries.slurm4sManaged,
+      Libraries.slurm4sLocal,
+      Libraries.slurm4sSsh,
       Libraries.munit % Test,
       Libraries.munitCatsEffect % Test
     )
   )
 
-// The ergonomics layer: five-line quickstarts without giving up an inch of the
-// honest core. Wire[A] givens derive codecs and schemas; Op bundles an
-// operation with its runner; Sojourn.local/slurm are one-call facades; run and
-// .value are documented opt-in conveniences that collapse the total TaskOutcome
-// into a typed exception (the full handle/outcome surface stays underneath).
+// Ergonomics: Op / Wire / Program / Simple* — no backend dependencies.
 lazy val dsl = project
   .in(file("modules/dsl"))
-  .dependsOn(local, slurm)
+  .dependsOn(core, worker)
   .settings(
     name := "sojourn-dsl",
+    libraryDependencies ++= Seq(
+      Libraries.catsEffect,
+      Libraries.munit % Test,
+      Libraries.munitCatsEffect % Test
+    ),
+    checkModuleBoundaries := assertNoSlurm4s("sojourn-dsl", update.value)
+  )
+
+// Convenience aggregate: Sojourn.local / slurm4sBatch constructors.
+lazy val all = project
+  .in(file("modules/all"))
+  .dependsOn(dsl, local, slurm)
+  .settings(
+    name := "sojourn-all",
     libraryDependencies ++= Seq(
       Libraries.munit % Test,
       Libraries.munitCatsEffect % Test
     )
   )
 
-// Published conformance kit (main scope, cats-laws pattern): abstract suites a
-// Site[F] backend instantiates over a TckHarness Resource.
+// Published conformance kit.
 lazy val tck = project
   .in(file("modules/tck"))
   .dependsOn(core)
@@ -130,16 +184,14 @@ lazy val tck = project
       Libraries.munitCatsEffect,
       Libraries.scalaCheck,
       Libraries.munitScalaCheck % Test
-    )
+    ),
+    checkModuleBoundaries := assertNoSlurm4s("sojourn-tck", update.value)
   )
 
-// Unpublished demo operations and the worker entry-point main used by tests and
-// acceptance. `demo/assembly` produces the one-shot worker binary the Slurm
-// acceptance run stages onto the shared workspace.
 lazy val demo = project
   .in(file("modules/demo"))
   .enablePlugins(NoPublishPlugin)
-  .dependsOn(local, slurm, tck)
+  .dependsOn(local, slurm, tck, all)
   .settings(
     name := "sojourn-demo",
     Compile / mainClass := Some("io.github.bbuchsbaum.sojourn.demo.DemoWorkerMain"),

@@ -3,7 +3,9 @@ import sbt.*
 object Dependencies {
   object Versions {
     val scala3 = "3.7.4"
-    val scalaSlurm = "0.1.0-SNAPSHOT"
+    // Immutable pin against a locally (and eventually centrally) published slurm4s release.
+    // Source SHA recorded in slurm4s.sha for the optional sibling integration job only.
+    val slurm4s = "0.1.0"
     val catsEffect = "3.7.0"
     val fs2 = "3.13.0"
     val circe = "0.14.16"
@@ -14,15 +16,15 @@ object Dependencies {
 
   object Libraries {
     val remoteExecKernel =
-      "io.github.bbuchsbaum" %% "remote-exec-kernel" % Versions.scalaSlurm
-    val scalaSlurmCore = "io.github.bbuchsbaum" %% "scala-slurm-core" % Versions.scalaSlurm
-    val scalaSlurmProtocol =
-      "io.github.bbuchsbaum" %% "scala-slurm-protocol" % Versions.scalaSlurm
-    val scalaSlurmWorker = "io.github.bbuchsbaum" %% "scala-slurm-worker" % Versions.scalaSlurm
-    val scalaSlurmManaged =
-      "io.github.bbuchsbaum" %% "scala-slurm-managed" % Versions.scalaSlurm
-    val scalaSlurmLocal = "io.github.bbuchsbaum" %% "scala-slurm-local" % Versions.scalaSlurm
-    val scalaSlurmSsh = "io.github.bbuchsbaum" %% "scala-slurm-ssh" % Versions.scalaSlurm
+      "io.github.bbuchsbaum" %% "remote-exec-kernel" % Versions.slurm4s
+    val slurm4sCore = "io.github.bbuchsbaum" %% "slurm4s-core" % Versions.slurm4s
+    val slurm4sProtocol =
+      "io.github.bbuchsbaum" %% "slurm4s-protocol" % Versions.slurm4s
+    val slurm4sWorker = "io.github.bbuchsbaum" %% "slurm4s-worker" % Versions.slurm4s
+    val slurm4sManaged =
+      "io.github.bbuchsbaum" %% "slurm4s-managed" % Versions.slurm4s
+    val slurm4sLocal = "io.github.bbuchsbaum" %% "slurm4s-local" % Versions.slurm4s
+    val slurm4sSsh = "io.github.bbuchsbaum" %% "slurm4s-ssh" % Versions.slurm4s
     val catsEffect = "org.typelevel" %% "cats-effect" % Versions.catsEffect
     val catsEffectTestkit = "org.typelevel" %% "cats-effect-testkit" % Versions.catsEffect
     val fs2Core = "co.fs2" %% "fs2-core" % Versions.fs2

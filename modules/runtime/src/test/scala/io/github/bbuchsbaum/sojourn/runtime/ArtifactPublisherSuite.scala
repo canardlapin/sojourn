@@ -1,7 +1,10 @@
 package io.github.bbuchsbaum.sojourn.runtime
 
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
+import scodec.bits.ByteVector
 import cats.effect.IO
 import cats.effect.Resource
+import cats.syntax.all.*
 import fs2.Stream
 import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
@@ -17,15 +20,15 @@ import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
-import io.github.bbuchsbaum.scalaslurm.core.Payload
-import io.github.bbuchsbaum.scalaslurm.core.RelativeOutputPath
-import io.github.bbuchsbaum.scalaslurm.core.ResultContract
-import io.github.bbuchsbaum.scalaslurm.worker.FileResultPublisher
-import io.github.bbuchsbaum.scalaslurm.worker.FileTaskContext
-import io.github.bbuchsbaum.scalaslurm.worker.FileTaskWorkspace
-import io.github.bbuchsbaum.scalaslurm.worker.TaskInvocations
-import io.github.bbuchsbaum.scalaslurm.worker.WorkerRunResult
-import io.github.bbuchsbaum.scalaslurm.worker.WorkerRuntime
+import io.github.bbuchsbaum.slurm4s.core.Payload
+import io.github.bbuchsbaum.slurm4s.core.RelativeOutputPath
+import io.github.bbuchsbaum.slurm4s.core.ResultContract
+import io.github.bbuchsbaum.slurm4s.worker.FileResultPublisher
+import io.github.bbuchsbaum.slurm4s.worker.FileTaskContext
+import io.github.bbuchsbaum.slurm4s.worker.FileTaskWorkspace
+import io.github.bbuchsbaum.slurm4s.worker.TaskInvocations
+import io.github.bbuchsbaum.slurm4s.worker.WorkerRunResult
+import io.github.bbuchsbaum.slurm4s.worker.WorkerRuntime
 import io.github.bbuchsbaum.sojourn.*
 
 import java.nio.charset.StandardCharsets
@@ -102,7 +105,7 @@ class ArtifactPublisherSuite extends munit.CatsEffectSuite:
     }
   }
 
-  test("WorkerBridge lowers contextual writes into the declared scala-slurm output workspace") {
+  test("WorkerBridge lowers contextual writes into the declared slurm4s output workspace") {
     temporaryDirectory.use { root =>
       val artifactPath = ArtifactPath.from("results/worker.bin").toOption.get
       val declarations = ArtifactDeclarations
@@ -144,7 +147,7 @@ class ArtifactPublisherSuite extends munit.CatsEffectSuite:
         ResultContract.Structured.from(stringResult, maximum, Vector(relative)).toOption.get
       val release = WorkerRelease(
         WorkerReleaseId.from("artifact-worker").toOption.get,
-        AtomicFiles.digestOf(Vector.empty)
+        AtomicFiles.digestOf(ByteVectors.of(Vector.empty))
       )
       val invocation = TaskInvocations
         .encodeRegistered(
@@ -224,6 +227,48 @@ class ArtifactPublisherSuite extends munit.CatsEffectSuite:
     assertEquals(registry.lookup(drifted), None)
   }
 
+  test("finish seals Open→Sealed; late writes return PublisherClosed; finish is idempotent") {
+    storeResource.use { store =>
+      for
+        publisher <- ArtifactPublisher.create[IO](store, declarations(firstPath))
+        written <- publisher.write(firstPath, Stream.emits(Vector[Byte](1, 2, 3)))
+        first <- publisher.finish
+        second <- publisher.finish
+        late <- publisher.write(firstPath, Stream.emits(Vector[Byte](9)))
+      yield
+        assert(written.isRight)
+        assert(first.isRight)
+        assertEquals(second, first)
+        assert(late.left.exists(_.isInstanceOf[ArtifactWriteFailure.PublisherClosed]))
+    }
+  }
+
+  test("concurrent finish races leave a single sealed publication result") {
+    storeResource.use { store =>
+      for
+        publisher <- ArtifactPublisher.create[IO](store, declarations(firstPath))
+        _ <- publisher.write(firstPath, Stream.emits(Vector[Byte](7)))
+        results <- List.fill(8)(publisher.finish).parSequence
+      yield
+        assert(results.forall(_.isRight))
+        assertEquals(results.map(_.toOption.get).distinct.size, 1)
+    }
+  }
+
+  test("a write that loses the Open→Sealed race returns PublisherClosed") {
+    storeResource.use { store =>
+      for
+        publisher <- ArtifactPublisher.create[IO](store, declarations(firstPath, secondPath))
+        _ <- publisher.write(firstPath, Stream.emits(Vector[Byte](1)))
+        // Seal before the second declared path is written.
+        sealedPublication <- publisher.finish
+        late <- publisher.write(secondPath, Stream.emits(Vector[Byte](2)))
+      yield
+        assert(sealedPublication.left.exists(_.isInstanceOf[ArtifactPublicationFailure.Missing]))
+        assert(late.left.exists(_.isInstanceOf[ArtifactWriteFailure.PublisherClosed]))
+    }
+  }
+
   private def declarations(paths: ArtifactPath*): ArtifactDeclarations =
     ArtifactDeclarations
       .from(
@@ -250,15 +295,15 @@ class ArtifactPublisherSuite extends munit.CatsEffectSuite:
   private val resultSchema = ResultSchemaId.from("artifact.worker.result.v1").toOption.get
   private val stringInput = new InputCodec[String]:
     val schemaId: SchemaId = inputSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
   private val stringResult = new ResultCodec[String]:
     val schemaId: ResultSchemaId = resultSchema
-    def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] =
-      Right(value.getBytes(StandardCharsets.UTF_8).toVector)
-    def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] =
+    def encode(value: String): Either[ResultCodecFailure, ByteVector] =
+      Right(ByteVector.view(value.getBytes(StandardCharsets.UTF_8)))
+    def decode(bytes: ByteVector): Either[ResultCodecFailure, String] =
       Right(new String(bytes.toArray, StandardCharsets.UTF_8))
 
   private def deleteTree(root: Path): IO[Unit] =
