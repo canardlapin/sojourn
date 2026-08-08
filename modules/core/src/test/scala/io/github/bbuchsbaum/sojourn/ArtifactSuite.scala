@@ -1,5 +1,6 @@
 package io.github.bbuchsbaum.sojourn
 
+import scodec.bits.ByteVector
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
 import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
 import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
@@ -56,8 +57,8 @@ class ArtifactSuite extends munit.FunSuite:
     val artifact = ref("result.bin", "3")
     def codec(value: String) = new InputCodec[String]:
       val schemaId = SchemaId.from(value).toOption.get
-      def encode(value: String): Either[ResultCodecFailure, Vector[Byte]] = Right(Vector.empty)
-      def decode(bytes: Vector[Byte]): Either[ResultCodecFailure, String] = Right("")
+      def encode(value: String): Either[ResultCodecFailure, ByteVector] = Right(ByteVector.empty)
+      def decode(bytes: ByteVector): Either[ResultCodecFailure, String] = Right("")
 
     assert(artifact.asInput(codec("artifact.bytes.v1")).isRight)
     assert(artifact.asInput(codec("artifact.other.v1")).isLeft)

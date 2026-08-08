@@ -8,13 +8,13 @@ import io.github.bbuchsbaum.remoteexec.kernel.InputCodec
 import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
 import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.ResourceRequest
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
-import io.github.bbuchsbaum.scalaslurm.ssh.SlurmSshConfig
-import io.github.bbuchsbaum.scalaslurm.ssh.SshConnection
-import io.github.bbuchsbaum.scalaslurm.ssh.SshTarget
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.slurm4s.core.ResourceRequest
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
+import io.github.bbuchsbaum.slurm4s.ssh.SlurmSshConfig
+import io.github.bbuchsbaum.slurm4s.ssh.SshConnection
+import io.github.bbuchsbaum.slurm4s.ssh.SshTarget
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
@@ -148,6 +148,10 @@ class SlurmCapabilitiesSuite extends munit.CatsEffectSuite:
       IO.raiseError(new AssertionError("unexpected putStream"))
     def fetchStream[A](ref: RemoteRef[A]): fs2.Stream[IO, Byte] =
       fs2.Stream.raiseError(new AssertionError("unexpected fetchStream"))
+    def readVerified[A](ref: RemoteRef[A]): IO[Either[StoreFailure, Vector[Byte]]] =
+      IO.raiseError(new AssertionError("unexpected readVerified"))
+    def streamVerifiedChunks[A](ref: RemoteRef[A]): fs2.Stream[IO, Byte] =
+      fs2.Stream.raiseError(new AssertionError("unexpected streamVerifiedChunks"))
 
   private def deleteTree(root: java.nio.file.Path): IO[Unit] =
     IO.blocking {

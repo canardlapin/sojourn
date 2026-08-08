@@ -17,6 +17,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 object ArtifactPath:
   opaque type Type = String
 
+  given CanEqual[Type, Type] = CanEqual.derived
+
   private val maxLength = 4096
 
   def from(raw: String): Either[ValidationFailure, Type] =
@@ -50,6 +52,8 @@ type ArtifactPath = ArtifactPath.Type
 /** A canonical media type without parameters, such as `application/x-nifti`. */
 object ArtifactMediaType:
   opaque type Type = String
+
+  given CanEqual[Type, Type] = CanEqual.derived
 
   def from(raw: String): Either[ValidationFailure, Type] =
     if raw == null then Left(ValidationFailure("artifactMediaType", "must not be null"))
@@ -174,6 +178,7 @@ enum ArtifactWriteFailure derives CanEqual:
   case Duplicate(path: ArtifactPath)
   case TooLarge(path: ArtifactPath, observedAtLeastBytes: Long, maximumBytes: Int)
   case Unavailable(path: ArtifactPath, detail: String)
+  case PublisherClosed(path: ArtifactPath)
 
 /** Why verified workload output could not be published as one complete durable artifact set. */
 enum ArtifactPublicationFailure derives CanEqual:

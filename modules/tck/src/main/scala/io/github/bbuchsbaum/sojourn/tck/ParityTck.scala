@@ -24,7 +24,7 @@ abstract class ParityTck extends CatsEffectSuite:
     "parity-tck-harness",
     for
       h <- harness
-      pool <- h.site.pool(h.poolSpec)
+      pool <- h.acquirePool
     yield (h, pool)
   )
 

@@ -3,6 +3,7 @@ package io.github.bbuchsbaum.sojourn.runtime.spool
 import cats.effect.kernel.Sync
 import cats.syntax.all.*
 import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
@@ -38,6 +39,8 @@ import scala.util.control.NonFatal
   *   - [[BindingMismatch]]: the canonical body does not bind to the filename (or to the reader's
   *     expected key). A `keyToken` is a locator, never an identity — this failure is exactly the
   *     event where the distinction matters, and an artifact carrying it never settles a handle.
+  *   - [[PilotIdentityMismatch]]: a registration or heartbeat body's `pilot` field does not match
+  *     the filename pilot it was read under — the artifact must not refresh that pilot's track.
   */
 enum SpoolIntegrityFailure derives CanEqual:
   case Missing(path: String)
@@ -50,6 +53,7 @@ enum SpoolIntegrityFailure derives CanEqual:
       bodyKey: SubmissionKey,
       bodyEpoch: AttemptEpoch
   )
+  case PilotIdentityMismatch(path: String, expected: PilotId, observed: PilotId)
 
   /** One canonical human-readable rendering, used by every diagnostic that carries this failure —
     * hoisted here so the rendering cannot drift between the pilot, dispatcher, and backends.
@@ -61,6 +65,8 @@ enum SpoolIntegrityFailure derives CanEqual:
     case BindingMismatch(path, token, epoch, bodyKey, bodyEpoch) =>
       s"binding mismatch at $path: filename ($token, e${epoch.value}) vs body " +
         s"(key '${bodyKey.value}', e${bodyEpoch.value})"
+    case PilotIdentityMismatch(path, expected, observed) =>
+      s"pilot identity mismatch at $path: filename '${expected.value}' vs body '${observed.value}'"
 
 /** How a result publication concluded: [[AlreadyPublished]] is typed and non-fatal — the published
   * result stands (invariant I2 admits exactly one result file per (key, epoch)).
@@ -164,7 +170,7 @@ final class SpoolFiles[F[_]: Sync](
   def publishManifest(manifest: PoolManifest): F[Either[AtomicFiles.WriteFailure, Unit]] =
     Sync[F].blocking(
       AtomicFiles
-        .publishOnceBlocking(paths.manifest, SpoolCodec.encodeManifest(manifest))
+        .publishOnceBlocking(paths.manifest, ByteVectors.of(SpoolCodec.encodeManifest(manifest)))
         .map(_ => ())
     )
 
@@ -182,7 +188,10 @@ final class SpoolFiles[F[_]: Sync](
       case Right(target) =>
         Sync[F].blocking(
           AtomicFiles
-            .publishOnceBlocking(target, SpoolCodec.encodeRegistration(registration))
+            .publishOnceBlocking(
+              target,
+              ByteVectors.of(SpoolCodec.encodeRegistration(registration))
+            )
             .map(_ => ())
         )
 
@@ -191,7 +200,13 @@ final class SpoolFiles[F[_]: Sync](
   ): F[Either[SpoolIntegrityFailure, Option[PilotRegistration]]] =
     paths.registrationFile(pilot) match
       case Left(failure) => integrityPathFailure(failure)
-      case Right(target) => readOptional(target, SpoolCodec.decodeRegistration)
+      case Right(target) =>
+        readOptional(target, SpoolCodec.decodeRegistration).map {
+          case Left(failure)       => Left(failure)
+          case Right(None)         => Right(None)
+          case Right(Some(record)) =>
+            verifyPilotIdentity(target.toString, pilot, record.pilot).map(_ => Some(record))
+        }
 
   /** Atomic whole-file replace — readers observe the previous or the next complete heartbeat, never
     * a torn one (invariant I8).
@@ -203,14 +218,31 @@ final class SpoolFiles[F[_]: Sync](
         Sync[F].blocking {
           try
             val _ = JFiles.createDirectories(paths.pilots)
-            AtomicFiles.replaceBlocking(target, SpoolCodec.encodeHeartbeat(beat))
+            AtomicFiles.replaceBlocking(target, ByteVectors.of(SpoolCodec.encodeHeartbeat(beat)))
           catch case NonFatal(error) => Left(AtomicFiles.WriteFailure.Io(describe(error)))
         }
 
   def readHeartbeat(pilot: PilotId): F[Either[SpoolIntegrityFailure, Option[PilotHeartbeat]]] =
     paths.heartbeatFile(pilot) match
       case Left(failure) => integrityPathFailure(failure)
-      case Right(target) => readOptional(target, SpoolCodec.decodeHeartbeat)
+      case Right(target) =>
+        readOptional(target, SpoolCodec.decodeHeartbeat).map {
+          case Left(failure)     => Left(failure)
+          case Right(None)       => Right(None)
+          case Right(Some(beat)) =>
+            verifyPilotIdentity(target.toString, pilot, beat.pilot).map(_ => Some(beat))
+        }
+
+  /** Filename pilot must equal the body's `pilot` field before the record may refresh that pilot's
+    * track. A mismatch is corruption evidence, never a trusted heartbeat/registration.
+    */
+  def verifyPilotIdentity(
+      path: String,
+      expected: PilotId,
+      observed: PilotId
+  ): Either[SpoolIntegrityFailure, Unit] =
+    if expected == observed then Right(())
+    else Left(SpoolIntegrityFailure.PilotIdentityMismatch(path, expected, observed))
 
   // ─── invocations ───────────────────────────────────────────────────────────
 
@@ -226,12 +258,13 @@ final class SpoolFiles[F[_]: Sync](
         Sync[F].blocking {
           try
             val _ = JFiles.createDirectories(paths.pending)
-            AtomicFiles.writeNewBlocking(target, SpoolCodec.encodeInvocation(invocation)) match
-              case Right(())                                                   => Right(())
-              case Left(AtomicFiles.WriteFailure.TargetExists(_))              => Right(())
-              case Left(other: AtomicFiles.WriteFailure.TargetConflict)        => Left(other)
-              case Left(other: AtomicFiles.WriteFailure.AtomicMoveUnavailable) => Left(other)
-              case Left(other: AtomicFiles.WriteFailure.Io)                    => Left(other)
+            AtomicFiles.writeNewBlocking(
+              target,
+              ByteVectors.of(SpoolCodec.encodeInvocation(invocation))
+            ) match
+              case Right(())                                      => Right(())
+              case Left(AtomicFiles.WriteFailure.TargetExists(_)) => Right(())
+              case Left(other)                                    => Left(other)
           catch case NonFatal(error) => Left(AtomicFiles.WriteFailure.Io(describe(error)))
         }
 
@@ -301,13 +334,11 @@ final class SpoolFiles[F[_]: Sync](
         case Left(failure) => pathFailure(failure)
         case Right(target) =>
           Sync[F].blocking {
-            AtomicFiles.publishOnceBlocking(target, bytes) match
+            AtomicFiles.publishOnceBlocking(target, ByteVectors.of(bytes)) match
               case Right(_) => Right(ResultPublication.Published)
               case Left(AtomicFiles.WriteFailure.TargetExists(_)) =>
                 Right(ResultPublication.AlreadyPublished)
-              case Left(other: AtomicFiles.WriteFailure.TargetConflict)        => Left(other)
-              case Left(other: AtomicFiles.WriteFailure.AtomicMoveUnavailable) => Left(other)
-              case Left(other: AtomicFiles.WriteFailure.Io)                    => Left(other)
+              case Left(other) => Left(other)
           }
 
   /** Targeted result check for (`keyToken`, `epoch`): absence is `None` (the ordinary state while
@@ -351,12 +382,13 @@ final class SpoolFiles[F[_]: Sync](
     */
   def writeDrain(drain: SpoolDrain): F[Either[AtomicFiles.WriteFailure, Unit]] =
     Sync[F].blocking {
-      AtomicFiles.writeNewBlocking(paths.drainMarker, SpoolCodec.encodeDrain(drain)) match
-        case Right(())                                                   => Right(())
-        case Left(AtomicFiles.WriteFailure.TargetExists(_))              => Right(())
-        case Left(other: AtomicFiles.WriteFailure.TargetConflict)        => Left(other)
-        case Left(other: AtomicFiles.WriteFailure.AtomicMoveUnavailable) => Left(other)
-        case Left(other: AtomicFiles.WriteFailure.Io)                    => Left(other)
+      AtomicFiles.writeNewBlocking(
+        paths.drainMarker,
+        ByteVectors.of(SpoolCodec.encodeDrain(drain))
+      ) match
+        case Right(())                                      => Right(())
+        case Left(AtomicFiles.WriteFailure.TargetExists(_)) => Right(())
+        case Left(other)                                    => Left(other)
     }
 
   /** Whether the drain marker exists. An unreadable spool must never silently read as "not

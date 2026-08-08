@@ -1,0 +1,1 @@
+{"actor":"sojourn-1-0","entity":"bd-01KZ6T7X0BV1JQ2S769C29DK31","kind":"note","note_kind":"note","op":"20260804T231754.954365Z-p33480-c0000-rabf6-hfca7d1","text":"Done: monotone TaskPhase.advance + uncancelable admit (local/pool/slurm); TaskLifecycle. sbt test green.","ts":"2026-08-04T23:17:54.954365Z","v":1}

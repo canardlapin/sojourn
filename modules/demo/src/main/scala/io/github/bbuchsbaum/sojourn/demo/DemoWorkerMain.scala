@@ -3,9 +3,9 @@ package io.github.bbuchsbaum.sojourn.demo
 import cats.effect.ExitCode
 import cats.effect.IO
 import cats.effect.IOApp
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
 import io.github.bbuchsbaum.sojourn.runtime.SojournEntryPoint
 
 /** The demo application's worker binary: `run --invocation <p> --result <p> --events <p>` executes

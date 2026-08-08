@@ -6,8 +6,10 @@ import io.github.bbuchsbaum.remoteexec.kernel.OperationVersion
 import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
 import io.github.bbuchsbaum.sojourn.ArtifactDeclarations
 import io.github.bbuchsbaum.sojourn.OperationContext
+import io.github.bbuchsbaum.sojourn.OperationContract
+import io.github.bbuchsbaum.sojourn.ReexecutionPolicy
 import io.github.bbuchsbaum.sojourn.SiteOperation
-import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
+import io.github.bbuchsbaum.sojourn.worker.OperationRegistry
 
 /** A named, versioned, typed operation together with its runner — everything a site needs to both
   * catalog and execute it, built from one call:
@@ -20,25 +22,30 @@ import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
   * construction (`Op` values are initialization-time constants — an invalid name surfaces at
   * startup, never mid-flight).
   *
-  * **Retry safety defaults to `Unknown` — at-most-once.** That is the safe default: a pool never
-  * re-dispatches an interrupted `Unknown` task automatically, because re-running an operation with
-  * side effects is not the library's call to make. Declare `.retrySafe` on operations that are
-  * genuinely idempotent to opt into automatic requeue (at-least-once).
+  * **Re-execution defaults to [[ReexecutionPolicy.Unspecified]]**, which Sojourn treats like
+  * [[ReexecutionPolicy.NeverAutomatically]] for automatic reclaim: a pool never re-dispatches an
+  * interrupted unspecified task on its own. That is **not** a physical at-most-once guarantee —
+  * backends, operators, or duplicate client submissions can still run another process. Declare
+  * `.retrySafe` / [[ReexecutionPolicy.SafeToRepeat]] only for genuinely idempotent work. Key side
+  * effects on [[io.github.bbuchsbaum.sojourn.RequestFingerprint]] when you need transactional
+  * idempotency.
   */
 final case class Op[I, O] private (
     operation: SiteOperation[I, O],
     runner: (I, OperationContext[IO]) => IO[O]
 ):
   def retrySafety: RetrySafety = operation.retrySafety
+  def reexecution: ReexecutionPolicy = operation.reexecution
   def artifacts: ArtifactDeclarations = operation.artifacts
+  def contract: OperationContract = operation.contract
 
   /** Declare this operation safe to re-execute automatically (idempotent side effects). */
   def retrySafe: Op[I, O] =
-    copy(operation = operation.withRetrySafety(RetrySafety.SafeForAutomaticRetry))
+    copy(operation = operation.withReexecution(ReexecutionPolicy.SafeToRepeat))
 
-  /** Declare this operation unsafe to ever re-execute automatically. */
+  /** Declare this operation must never be re-executed automatically by Sojourn. */
   def neverRetry: Op[I, O] =
-    copy(operation = operation.withRetrySafety(RetrySafety.NoAutomaticRetry))
+    copy(operation = operation.withReexecution(ReexecutionPolicy.NeverAutomatically))
 
   /** Declare the complete set of files this operation must publish before it can succeed. */
   def produces(value: ArtifactDeclarations): Op[I, O] =

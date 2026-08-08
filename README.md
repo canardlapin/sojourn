@@ -30,7 +30,7 @@ pools with `awaitGranted` — is one method away, and `site.raw` exposes the
 entire SPI. Operations default to at-most-once (`RetrySafety.Unknown`);
 `.retrySafe` is an explicit opt-in to automatic requeue.
 
-The scheduler-specific substrate is [scala-slurm](../scala-slurm); sojourn's API
+The scheduler-specific substrate is [slurm4s](https://github.com/canardlapin/slurm4s); sojourn's API
 is scheduler-neutral and Slurm words never appear in it. The two truths a batch
 backend cannot abstract away — the queue and the walltime lease — are modeled in
 the types instead (`LeaseState`, total `TaskOutcome`, `Unknown` as a case rather
@@ -48,40 +48,52 @@ Design: `docs/architecture/0001-site-layer.md` (site layer) and
 `docs/architecture/0002-spool-runtime.md` (spool runtime semantics: the reclaim
 evidence ladder, epoch fence, clock-free heartbeat staleness, drain, and lease
 machine). `docs/architecture/0004-compositional-slurm.md` records the exact
-Sojourn/scala-slurm ownership boundary and local/SSH capability assembly.
+Sojourn/slurm4s ownership boundary and local/SSH capability assembly.
 `docs/architecture/0005-durable-artifacts.md` defines file-producing operation,
 promotion, and pipeline-composition semantics.
-Program plan: `docs/plans/2026-07-24-remote-executor.md`.
+1.0 contract plan: `docs/plans/2026-08-04-sojourn-1-0-contract.md`.
 
 ## Modules
 
 | Module | Boundary |
 | --- | --- |
-| `sojourn-core` | Pure SPI (`Site`, `SiteStore`, `TaskRunner`, `LeasedPool`, `LeaseState`, total `TaskOutcome`), durable artifact contracts, validated identifiers, spool wire protocol v1 with canonical codecs + golden fixtures |
-| `sojourn-runtime` | Scheduler-neutral effectful machinery: content-addressed shared-FS store and complete artifact-set promotion, operation registry, site preflight probes, the one worker binary (one-shot + pilot modes), pilot loop, pool dispatcher (reclaim ladder, epoch fence, lease governance) |
-| `sojourn-local` | Scheduler-free backend: batch on supervised fibers, pool as in-process pilots over a real filesystem spool — the neutrality proof and dev-mode |
-| `sojourn-slurm` | The exemplary Slurm backend: one managed executor assembled over local CLI or SSH, typed staging, durable control, and strict digest-verified result attachment |
-| `sojourn-dsl` | The ergonomics layer: `Wire[A]` givens, `Op`, compile-time-checked identifier literals, `Sojourn.local`/`slurm`/`slurmSsh` facades, and `run`/`value` conveniences over the total outcome |
-| `sojourn-tck` | Published conformance suites (`StoreTck`, `BatchTck`, `PoolTck`, `ParityTck`) any backend instantiates over a `TckHarness` |
-| `sojourn-demo` | Unpublished demo operations + the assembled worker binary used by tests and acceptance |
+| `sojourn-core` | SPI (`Site` / `PoolCapableSite`, `PoolRequest`, `BatchDriver`, store/batch algebras, total `TaskOutcome`), durable artifact contracts, `RequestFingerprint`, spool wire protocol v1 |
+| `sojourn-worker` | Program / `OperationRegistry` execution — backend-neutral; no slurm4s dependency |
+| `sojourn-runtime` | Effectful machinery: FS store, site preflight, pilot loop, pool dispatcher. Still hosts `SojournEntryPoint`/`WorkerBridge` (slurm4s-worker) until those finish migrating into `sojourn-slurm` |
+| `sojourn-local` | Scheduler-free `PoolCapableSite`: batch on supervised fibers; pools as in-process pilots over a real filesystem spool |
+| `sojourn-slurm` | Exemplary Slurm **batch** `Site` today (`slurm4sBatch`); the only module that may depend on slurm4s scheduler artifacts long-term. Slurm `PoolCapableSite` is required before `1.0.0` |
+| `sojourn-dsl` | Ergonomics only: `Wire`, `Op`, `Program`, `SimpleSite` — **no** backend or slurm4s dependency |
+| `sojourn-all` | Convenience constructors: `Sojourn.local` / `slurm4sBatch` / `slurmSsh` |
+| `sojourn-tck` | Published conformance suites (`StoreTck`, `BatchTck`, `PoolTck`, `ParityTck`) |
+| `sojourn-demo` | Unpublished demo operations + assembled worker binary |
 
 Provider-neutral contracts and atomic filesystem mechanics come from
-`remote-exec-kernel`; both Sojourn and scala-slurm depend downward on that
-artifact. `sojourn-core` has no scala-slurm dependency. The ownership rule is
+`remote-exec-kernel`; both Sojourn and slurm4s depend downward on that
+artifact. `sojourn-core`, `sojourn-worker`, and `sojourn-dsl` have no slurm4s
+dependency (enforced by `checkModuleBoundaries`). The ownership rule is
 recorded in `docs/architecture/0003-provider-neutral-kernel.md`; the remaining
 composition boundary is recorded in `docs/architecture/0004-compositional-slurm.md`.
 
 ## Build
 
-JDK 17+, Scala 3.7.4. Until scala-slurm publishes artifacts, resolve it locally.
-`scala-slurm.sha` pins the exact scala-slurm commit this tree is built and tested
-against — bump it deliberately (it is a reviewed diff), republish, and re-test:
+JDK 17+, Scala 3.7.4. Depends on published `remote-exec-kernel` and `slurm4s-*`
+artifacts at the exact version in `project/Dependencies.scala` (currently
+`0.1.0`). Normal development and CI resolve those coordinates from the
+configured resolvers — not via sibling `publishLocal`.
 
 ```shell
-cd ../scala-slurm && git checkout "$(cat ../sojourn/scala-slurm.sha)" \
-  && sbt 'set ThisBuild/version := "0.1.0-SNAPSHOT"' +publishLocal
+sbt test
+```
+
+`slurm4s.sha` records the slurm4s commit used to produce the pinned `0.1.0`
+artifacts for the optional sibling integration job only:
+
+```shell
+cd ../slurm4s && git checkout "$(cat ../sojourn/slurm4s.sha)" \
+  && sbt 'set ThisBuild/version := "0.1.0"' 'set ThisBuild/isSnapshot := false' publishLocal
 cd ../sojourn && sbt test
 ```
 
-When both repos have Git remotes, CI consumes the pin the same way: clone
-scala-slurm, check out the pinned sha, `+publishLocal`, then build sojourn.
+Until `0.1.0` is on a public resolver, publish that immutable version once
+locally (or to your org's repository) from the SHA above. CI's default job
+must not clone the sibling; a separate workflow may.

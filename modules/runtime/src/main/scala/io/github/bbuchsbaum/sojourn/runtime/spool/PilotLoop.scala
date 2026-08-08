@@ -9,6 +9,7 @@ import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
 import io.github.bbuchsbaum.sojourn.OperationDescriptor
 import io.github.bbuchsbaum.sojourn.StoreFailure
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
 import io.github.bbuchsbaum.sojourn.runtime.OperationRunFailure
@@ -69,14 +70,21 @@ enum PilotFatal derives CanEqual:
     */
   case ResultUnpublishable(detail: String)
 
+  /** Heartbeat writes failed consecutively beyond the bound — the pilot can no longer prove
+    * liveness to the dispatcher and must exit so reclaim can proceed on backend evidence.
+    */
+  case HeartbeatUnwritable(consecutiveFailures: Int, detail: String)
+
   /** Canonical rendering for backend diagnostics and the binary edge. */
   def describe: String = this match
-    case SpoolInvalid(detail)         => s"spool invalid: $detail"
-    case ManifestUnavailable(failure) => s"manifest unavailable: ${failure.describe}"
-    case AlreadyRegistered(pilot)     => s"pilot id ${pilot.value} already registered"
-    case RegistrationFailed(detail)   => s"registration failed: $detail"
-    case AtomicMoveUnavailable(path)  => s"atomic move unavailable: $path"
-    case ResultUnpublishable(detail)  => s"result unpublishable: $detail"
+    case SpoolInvalid(detail)           => s"spool invalid: $detail"
+    case ManifestUnavailable(failure)   => s"manifest unavailable: ${failure.describe}"
+    case AlreadyRegistered(pilot)       => s"pilot id ${pilot.value} already registered"
+    case RegistrationFailed(detail)     => s"registration failed: $detail"
+    case AtomicMoveUnavailable(path)    => s"atomic move unavailable: $path"
+    case ResultUnpublishable(detail)    => s"result unpublishable: $detail"
+    case HeartbeatUnwritable(n, detail) =>
+      s"heartbeat unwritable after $n consecutive failures: $detail"
 
 /** Why the pilot stopped claiming. */
 enum PilotStopCause derives CanEqual:
@@ -156,7 +164,7 @@ object PilotLoop:
     }
 
   /** How one claim round concluded. */
-  private enum ClaimRound:
+  private enum ClaimRound derives CanEqual:
     case Claimed
     case NoneAvailable
     case Fatal(failure: PilotFatal)
@@ -174,7 +182,9 @@ object PilotLoop:
       claimed: Ref[IO, Option[SpoolClaim]],
       evidence: Ref[IO, Vector[Diagnostic]],
       noted: Ref[IO, Set[String]],
-      beatMutex: Mutex[IO]
+      beatMutex: Mutex[IO],
+      heartbeatWriteFailures: Ref[IO, Int],
+      heartbeatFatal: Ref[IO, Option[PilotFatal]]
   ):
     private val heartbeatCadence: FiniteDuration = manifest.heartbeatEvery.value.millis
     private val idlePause: FiniteDuration =
@@ -209,12 +219,23 @@ object PilotLoop:
             PilotHeartbeat(config.pilot, at, next, currentState, currentClaim)
           )
           _ <- written match
-            case Right(())     => IO.unit
+            case Right(())     => heartbeatWriteFailures.set(0)
             case Left(failure) =>
-              recordOnce(
-                "heartbeat-write-failed",
-                Diagnostic("pilot-heartbeat-write-failed", SpoolEvidence.describeWrite(failure))
-              )
+              val detail = SpoolEvidence.describeWrite(failure)
+              heartbeatWriteFailures.getAndUpdate(_ + 1).flatMap { previous =>
+                val consecutive = previous + 1
+                record(
+                  Diagnostic(
+                    "pilot-heartbeat-write-failed",
+                    s"$detail (consecutive=$consecutive)"
+                  )
+                ) *> (
+                  if consecutive >= Station.maxConsecutiveHeartbeatFailures then
+                    val fatal = PilotFatal.HeartbeatUnwritable(consecutive, detail)
+                    heartbeatFatal.update(_.orElse(Some(fatal))).void
+                  else IO.unit
+                )
+              }
         yield ()
       }
 
@@ -251,20 +272,24 @@ object PilotLoop:
       }
 
     private def claimLoop(executed: Long): IO[Either[PilotFatal, (PilotStopCause, Long)]] =
-      stopCause.flatMap {
-        case Some(cause) => IO.pure(Right((cause, executed)))
+      heartbeatFatal.get.flatMap {
+        case Some(fatal) => IO.pure(Left(fatal))
         case None        =>
-          spool.listPending.flatMap {
-            case Left(failure) =>
-              recordOnce(
-                "pending-list-failed",
-                Diagnostic("pilot-pending-list-failed", failure.describe)
-              ) *> IO.sleep(idlePause) *> claimLoop(executed)
-            case Right(files) =>
-              tryClaims(files).flatMap {
-                case ClaimRound.Fatal(fatal)  => IO.pure(Left(fatal))
-                case ClaimRound.Claimed       => claimLoop(executed + 1L)
-                case ClaimRound.NoneAvailable => IO.sleep(idlePause) *> claimLoop(executed)
+          stopCause.flatMap {
+            case Some(cause) => IO.pure(Right((cause, executed)))
+            case None        =>
+              spool.listPending.flatMap {
+                case Left(failure) =>
+                  recordOnce(
+                    "pending-list-failed",
+                    Diagnostic("pilot-pending-list-failed", failure.describe)
+                  ) *> IO.sleep(idlePause) *> claimLoop(executed)
+                case Right(files) =>
+                  tryClaims(files).flatMap {
+                    case ClaimRound.Fatal(fatal)  => IO.pure(Left(fatal))
+                    case ClaimRound.Claimed       => claimLoop(executed + 1L)
+                    case ClaimRound.NoneAvailable => IO.sleep(idlePause) *> claimLoop(executed)
+                  }
               }
           }
       }
@@ -339,7 +364,23 @@ object PilotLoop:
                   Some(SpoolClaim(invocation.key, invocation.attemptEpoch))
                 )
                 startedAt <- config.now
-                status <- execute(invocation)
+                status <-
+                  if invocation.limits != manifest.limits then
+                    IO.pure(
+                      SpoolResultStatus.Failed(
+                        "invocation-limits-mismatch",
+                        "invocation.limits do not match the pool manifest limits"
+                      )
+                    )
+                  else if invocation.releaseDigest != config.release.digest then
+                    IO.pure(
+                      SpoolResultStatus.Failed(
+                        "release-digest-mismatch",
+                        s"invocation expected ${invocation.releaseDigest.value}, " +
+                          s"pilot has ${config.release.digest.value}"
+                      )
+                    )
+                  else execute(invocation)
                 finishedAt <- config.now
                 released <- publishAndRelease(
                   claimedFile,
@@ -383,14 +424,15 @@ object PilotLoop:
                 )
               )
             case Right(bytes) =>
-              registered.run(bytes).flatMap {
+              registered.run(ByteVectors.of(bytes)).flatMap {
                 case Left(OperationRunFailure.InvalidInput(detail)) =>
                   IO.pure(SpoolResultStatus.Failed("invalid-input", detail))
                 case Left(OperationRunFailure.Execution(code, message)) =>
                   IO.pure(SpoolResultStatus.Failed(code, message))
                 case Left(OperationRunFailure.InvalidResult(detail)) =>
                   IO.pure(SpoolResultStatus.Failed("invalid-result", detail))
-                case Right(resultBytes) => publishValue(invocation, resultBytes)
+                case Right(resultBytes) =>
+                  publishValue(invocation, ByteVectors.toVector(resultBytes))
               }
           }
 
@@ -438,6 +480,10 @@ object PilotLoop:
         invocation.resultSchema,
         config.pilot,
         config.release.id,
+        config.release.digest,
+        invocation.requestFingerprint,
+        invocation.catalogFingerprint,
+        invocation.manifestDigest,
         invocation.retrySafety,
         startedAt,
         finishedAt,
@@ -485,6 +531,11 @@ object PilotLoop:
       }
 
   private object Station:
+    /** Consecutive heartbeat write failures before the pilot exits as
+      * [[PilotFatal.HeartbeatUnwritable]].
+      */
+    val maxConsecutiveHeartbeatFailures: Int = 3
+
     def create(
         config: PilotLoopConfig,
         spool: SpoolFiles[IO],
@@ -501,6 +552,8 @@ object PilotLoop:
         evidence <- Ref.of[IO, Vector[Diagnostic]](Vector.empty)
         noted <- Ref.of[IO, Set[String]](Set.empty)
         beatMutex <- Mutex[IO]
+        heartbeatWriteFailures <- Ref.of[IO, Int](0)
+        heartbeatFatal <- Ref.of[IO, Option[PilotFatal]](None)
       yield new Station(
         config,
         spool,
@@ -514,5 +567,7 @@ object PilotLoop:
         claimed,
         evidence,
         noted,
-        beatMutex
+        beatMutex,
+        heartbeatWriteFailures,
+        heartbeatFatal
       )

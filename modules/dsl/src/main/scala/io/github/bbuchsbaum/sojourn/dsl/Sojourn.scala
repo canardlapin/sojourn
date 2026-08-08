@@ -2,25 +2,13 @@ package io.github.bbuchsbaum.sojourn.dsl
 
 import cats.effect.IO
 import cats.effect.Resource
-import cats.syntax.all.*
-import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
-import io.github.bbuchsbaum.scalaslurm.core.DurationMillis
-import io.github.bbuchsbaum.scalaslurm.core.PositiveInt
-import io.github.bbuchsbaum.scalaslurm.core.ResourceRequest
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.WallTimeMinutes
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.ssh.SlurmSshConfig
+import io.github.bbuchsbaum.remoteexec.kernel.DurationMillis
+import io.github.bbuchsbaum.remoteexec.kernel.PositiveInt
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.WallTimeMinutes
 import io.github.bbuchsbaum.sojourn.*
-import io.github.bbuchsbaum.sojourn.local.LocalSite
-import io.github.bbuchsbaum.sojourn.local.LocalSiteConfig
-import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
-import io.github.bbuchsbaum.sojourn.slurm.SlurmSite
-import io.github.bbuchsbaum.sojourn.slurm.SlurmSiteConfig
+import io.github.bbuchsbaum.sojourn.worker.OperationRegistry
 
-import java.nio.file.Files as JFiles
-import java.nio.file.Path
-import java.util.Comparator
 import java.util.UUID
 import scala.concurrent.duration.*
 
@@ -105,11 +93,7 @@ final class SimpleRunner private[dsl] (
       case Left(rejection) => IO.raiseError(SubmitRefused(rejection))
     }
 
-  /** Submit-and-await in one call — the five-line-quickstart verb. Success returns the
-    * digest-verified value; anything else raises typed ([[SubmitRefused]] / [[TaskDidNotSucceed]] /
-    * [[ResultUnavailable]]) with the full evidence attached. Use [[submit]] +
-    * [[SimpleHandle.outcome]] when you need the total view.
-    */
+  /** Submit-and-await in one call — the five-line-quickstart verb. */
   def run[I, O](op: Op[I, O], input: I): IO[O] =
     submit(op, input).flatMap(_.value)
 
@@ -134,25 +118,30 @@ final class SimplePool private[dsl] (
 ):
   export batchlike.{put, run, submit, submitStored}
 
-  /** The honest lease: observed deadline, ready count, ordered events, revocation signal. */
   def lease: LeaseState[IO] = pool.lease
 
-  /** Wait until the pool first reaches its readiness floor (or reports why it never will). */
   def awaitGranted: IO[Either[LeaseRevocation, PilotCount]] =
     pool.lease.awaitGranted
 
-/** A [[Site]] with the ceremony folded away. `raw` is always there — the DSL narrows nothing. */
+/** A [[Site]] with the ceremony folded away. Batch constructors (e.g. Slurm today) return this. */
 final class SimpleSite private[dsl] (val raw: Site[IO]):
   private val runner = SimpleRunner(raw.batch, raw.store)
   export runner.{put, run, submit, submitStored}
 
   def name: SiteName = raw.name
+  def id: SiteId = raw.id
   def operations: OperationCatalog = raw.operations
   def store: SiteStore[IO] = raw.store
 
-  /** Acquire a leased pilot pool with sensible defaults; every default is overridable and the full
-    * [[PoolSpec]] path remains available through [[raw]].
-    */
+object SimpleSite:
+  def apply(site: Site[IO]): SimpleSite = new SimpleSite(site)
+
+/** A [[PoolCapableSite]] with the ceremony folded away — typed pool acquisition, no cast / UOE. */
+final class SimplePoolCapableSite private[dsl] (val capable: PoolCapableSite[IO]):
+  private val site = SimpleSite(capable)
+  export site.{raw, name, id, operations, store, put, run, submit, submitStored}
+
+  /** Acquire a leased pilot pool. */
   def pool(
       pilots: Int = 2,
       minReady: Int = 1,
@@ -167,8 +156,8 @@ final class SimpleSite private[dsl] (val raw: Site[IO]):
           poolSpec(pilots, minReady, walltimeMinutes, heartbeat, drainGrace, readyTimeout)
         )
       )
-      .flatMap(raw.pool)
-      .map(pool => SimplePool(pool, SimpleRunner(pool, raw.store)))
+      .flatMap(capable.pools.acquire)
+      .map(pool => SimplePool(pool, SimpleRunner(pool, capable.store)))
 
   private def poolSpec(
       pilots: Int,
@@ -189,107 +178,19 @@ final class SimpleSite private[dsl] (val raw: Site[IO]):
       spec <- PoolSpec.from(pilotCount, ready, walltime, grace, beat, readyBound, root)
     yield spec).left.map(failure => new IllegalArgumentException(failure.reason))
 
-/** One-call site construction. Every facade returns the same [[SimpleSite]]; swapping backends
-  * changes exactly one line, which is the point the conformance kit enforces.
-  */
-object Sojourn:
-  /** A scheduler-free site rooted in a fresh temporary directory (deleted on release) — the
-    * dev-mode and testing entry point.
-    */
-  def local(name: String, ops: Op[?, ?]*): Resource[IO, SimpleSite] =
-    temporaryRoot.flatMap(root => localAt(name, root, ops*))
+object SimplePoolCapableSite:
+  def apply(site: PoolCapableSite[IO]): SimplePoolCapableSite = new SimplePoolCapableSite(site)
 
-  /** A scheduler-free site rooted at `root` (retained on release). */
-  def localAt(name: String, root: Path, ops: Op[?, ?]*): Resource[IO, SimpleSite] =
-    for
-      site <- Resource.eval(parseSiteName(name))
-      registry <- Resource.eval(registryOf(ops))
-      backend <- LocalSite.open(
-        LocalSiteConfig(site, root, ByteLimit.maximumCommandCapture),
-        registry
-      )
-    yield SimpleSite(backend)
-
-  /** The Slurm-backed site: a shared workspace, the deployed worker binary, and its release
-    * identity. Defaults: 1 cpu / 1 task per job; override via `resources`.
-    */
-  def slurm(
-      name: String,
-      workspace: Path,
-      workerExecutable: Path,
-      release: WorkerRelease,
-      ops: Seq[Op[?, ?]],
-      resources: Option[ResourceRequest] = None
-  ): Resource[IO, SimpleSite] =
-    for
-      site <- Resource.eval(parseSiteName(name))
-      registry <- Resource.eval(registryOf(ops))
-      defaults <- Resource.eval(defaultResources(resources))
-      backend <- SlurmSite.local(
-        SlurmSiteConfig(site, workspace, workerExecutable, release, defaults),
-        registry
-      )
-    yield SimpleSite(backend)
-
-  /** The same Slurm site semantics over scala-slurm's negotiated OpenSSH agent transport. */
-  def slurmSsh(
-      name: String,
-      workspace: Path,
-      workerExecutable: Path,
-      release: WorkerRelease,
-      ssh: SlurmSshConfig,
-      ops: Seq[Op[?, ?]],
-      resources: Option[ResourceRequest] = None
-  ): Resource[IO, SimpleSite] =
-    for
-      site <- Resource.eval(parseSiteName(name))
-      registry <- Resource.eval(registryOf(ops))
-      defaults <- Resource.eval(defaultResources(resources))
-      backend <- SlurmSite.overSsh(
-        SlurmSiteConfig(site, workspace, workerExecutable, release, defaults),
-        ssh,
-        registry
-      )
-    yield SimpleSite(backend)
-
-  /** The registry the worker binary needs — built from the same `Op` values the submitting side
-    * uses, so both execution shapes provably run identical code.
+/** Backend-free DSL helpers. Site constructors live in `sojourn-all` ([[Sojourn]]). */
+object Dsl:
+  /** The registry the worker binary needs — built from the same `Op` / [[Program]] the submitting
+    * side uses.
     */
   def registryOf(ops: Seq[Op[?, ?]]): IO[OperationRegistry[IO]] =
     IO.fromEither(
-      OperationRegistry
-        .from[IO](ops.toVector.map(_.entry))
+      Program
+        .from(ops.toVector)
+        .registry
         .left
         .map(failure => new IllegalArgumentException(failure.reason))
-    )
-
-  private def parseSiteName(name: String): IO[SiteName] =
-    IO.fromEither(
-      SiteName.from(name).left.map(failure => new IllegalArgumentException(failure.reason))
-    )
-
-  private def defaultResources(explicit: Option[ResourceRequest]): IO[ResourceRequest] =
-    explicit match
-      case Some(value) => IO.pure(value)
-      case None        =>
-        IO.fromEither(
-          ResourceRequest
-            .validate(cpusPerTask = 1, tasks = 1, nodes = None, memory = None, wallTime = None)
-            .toEither
-            .left
-            .map(failures =>
-              new IllegalArgumentException(failures.toList.map(_.reason).mkString("; "))
-            )
-        )
-
-  private def temporaryRoot: Resource[IO, Path] =
-    Resource.make(IO.blocking(JFiles.createTempDirectory("sojourn-local")))(root =>
-      IO.blocking {
-        val _ = JFiles
-          .walk(root)
-          .sorted(Comparator.reverseOrder())
-          .forEach { path =>
-            val _ = JFiles.deleteIfExists(path)
-          }
-      }
     )

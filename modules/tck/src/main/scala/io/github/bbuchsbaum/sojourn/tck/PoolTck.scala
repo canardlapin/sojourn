@@ -32,7 +32,7 @@ abstract class PoolTck extends CatsEffectSuite:
     "pool-tck-harness",
     for
       h <- harness
-      pool <- h.site.pool(h.poolSpec)
+      pool <- h.acquirePool
     yield (h, pool)
   )
 
@@ -105,15 +105,17 @@ abstract class PoolTck extends CatsEffectSuite:
       assertEquals(one, two)
       assertEquals(after - before, 1L)
       conflicted match
-        case Left(SubmitRejection.Conflict(observed)) => assertEquals(observed, key)
-        case other                                    => fail(s"expected Conflict, observed $other")
+        case Left(SubmitRejection.Conflict(observed, existing, proposed)) =>
+          assertEquals(observed, key)
+          assertNotEquals(existing, proposed)
+        case other => fail(s"expected Conflict, observed $other")
   }
 
   test("law P5: release drains cleanly, closes submission, and revokes exactly once") {
     // Deliberately leaks the pool value past its Resource scope: the law is precisely about what
     // a stale reference observes after release.
     harness
-      .flatMap(h => h.site.pool(h.poolSpec).map(pool => (h, pool)))
+      .flatMap(h => h.acquirePool.map(pool => (h, pool)))
       .use { case (h, pool) =>
         for
           handle <- pool

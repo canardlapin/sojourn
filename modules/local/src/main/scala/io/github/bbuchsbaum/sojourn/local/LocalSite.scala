@@ -7,19 +7,23 @@ import cats.effect.kernel.Ref
 import cats.effect.kernel.Resource
 import cats.effect.std.Supervisor
 import cats.syntax.all.*
-import io.github.bbuchsbaum.scalaslurm.core.ByteLimit
-import io.github.bbuchsbaum.scalaslurm.core.ContentDigest
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostic
-import io.github.bbuchsbaum.scalaslurm.core.Diagnostics
-import io.github.bbuchsbaum.scalaslurm.core.FailureCause
-import io.github.bbuchsbaum.scalaslurm.core.FailureDiagnosis
-import io.github.bbuchsbaum.scalaslurm.core.Freshness
-import io.github.bbuchsbaum.scalaslurm.core.SchemaId
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
-import io.github.bbuchsbaum.scalaslurm.core.ValidationFailure
-import io.github.bbuchsbaum.scalaslurm.core.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.core.WorkerReleaseId
-import io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptEpoch
+import io.github.bbuchsbaum.remoteexec.kernel.AttemptId
+import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
+import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostic
+import io.github.bbuchsbaum.remoteexec.kernel.Diagnostics
+import io.github.bbuchsbaum.remoteexec.kernel.FailureCause
+import io.github.bbuchsbaum.remoteexec.kernel.FailureDiagnosis
+import io.github.bbuchsbaum.remoteexec.kernel.Freshness
+import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
+import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
+import io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles
+import io.github.bbuchsbaum.remoteexec.kernel.ResultCodec
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.runtime.ArtifactPublisher
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
@@ -67,10 +71,10 @@ final class LocalSiteUnavailable(val failure: PreflightFailure)
   */
 final class LocalPoolUnavailable(detail: String) extends RuntimeException(detail)
 
-/** The scheduler-free [[Site]]: batch tasks execute on supervised fibers of this process, but
-  * through the same store-mediated result path as any remote backend — every success is a
-  * digest-verified [[RemoteRef]] in the site store, never an in-memory value. The pool runs real
-  * [[PilotLoop]]s over a real filesystem spool (real rename races), dispatched by the shared
+/** The scheduler-free [[PoolCapableSite]]: batch tasks execute on supervised fibers of this
+  * process, but through the same store-mediated result path as any remote backend — every success
+  * is a digest-verified [[RemoteRef]] in the site store, never an in-memory value. The pool runs
+  * real [[PilotLoop]]s over a real filesystem spool (real rename races), dispatched by the shared
   * [[PoolDispatcher]].
   *
   * IO-shaped by commitment, not accident: the pilot runtime is the same code that runs inside the
@@ -81,7 +85,7 @@ object LocalSite:
   def open(
       config: LocalSiteConfig,
       registry: OperationRegistry[IO]
-  ): Resource[IO, Site[IO]] =
+  ): Resource[IO, PoolCapableSite[IO]] =
     for
       supervisor <- Supervisor[IO]
       closed <- Resource.make(Ref.of[IO, Boolean](false))(_.set(true))
@@ -100,12 +104,12 @@ object LocalSite:
 
   /** One accepted submission: its request identity for conflict detection plus its live state. */
   final private case class LocalTask(
-      descriptor: OperationDescriptor,
-      inputIdentity: ContentDigest,
-      artifacts: ArtifactDeclarations,
+      fingerprint: RequestFingerprint,
       phase: Ref[IO, TaskPhase],
-      outcome: Deferred[IO, TaskOutcome[Nothing]],
-      cancelRequested: Deferred[IO, Unit]
+      outcome: Deferred[IO, TaskResult[Nothing]],
+      cancelRequested: Deferred[IO, Unit],
+      attemptId: AttemptId,
+      startedAt: Instant
   )
 
   final private class LocalSiteImpl(
@@ -115,13 +119,50 @@ object LocalSite:
       tasks: Ref[IO, Map[SubmissionKey, LocalTask]],
       supervisor: Supervisor[IO],
       closed: Ref[IO, Boolean]
-  ) extends Site[IO]:
+  ) extends PoolCapableSite[IO]:
 
     val name: SiteName = config.name
 
     val operations: OperationCatalog = registry.catalog
 
     def store: SiteStore[IO] = fsStore
+
+    def attach[O](
+        descriptor: TaskDescriptor,
+        result: ResultCodec[O]
+    ): IO[Either[AttachFailure, TaskHandle[IO, O]]] =
+      IO.pure(Left(AttachFailure.NotSupported))
+
+    def pools: PoolAllocator[IO] = localPools
+
+    private val localPools = new PoolAllocator[IO]:
+      def acquire(
+          request: PoolRequest,
+          transport: Option[SharedFsPoolConfig]
+      ): Resource[IO, LeasedPool[IO]] =
+        transport match
+          case None =>
+            Resource.raiseError[IO, LeasedPool[IO], Throwable](
+              new LocalPoolUnavailable("local pools require SharedFsPoolConfig transport")
+            )
+          case Some(cfg) =>
+            val spec = PoolSpec
+              .from(
+                request.capacity,
+                request.minimumReady,
+                cfg.walltime,
+                cfg.drainGrace,
+                cfg.heartbeatEvery,
+                cfg.readyTimeout,
+                cfg.spoolRoot
+              )
+              .fold(
+                failure => throw new IllegalArgumentException(failure.reason),
+                identity
+              )
+            acquireSpec(spec)
+
+      def acquire(spec: PoolSpec): Resource[IO, LeasedPool[IO]] = acquireSpec(spec)
 
     // ─── pool ────────────────────────────────────────────────────────────────
 
@@ -133,7 +174,7 @@ object LocalSite:
       * settle → backend cancellation → `Revoked(Cancelled)`), where "backend cancellation" is the
       * cancellation of the pilot fibers; the outer per-fiber finalizers then reap any stragglers.
       */
-    def pool(spec: PoolSpec): Resource[IO, LeasedPool[IO]] =
+    private def acquireSpec(spec: PoolSpec): Resource[IO, LeasedPool[IO]] =
       for
         _ <- Resource.eval(
           closed.get.flatMap(isClosed =>
@@ -179,6 +220,7 @@ object LocalSite:
           spec = spec,
           manifest = manifest,
           pilots = pilotIds,
+          releaseDigest = release.digest,
           initialDeadline = deadline,
           pollEvery = math.max(25L, math.min(1000L, spec.heartbeatEvery.value / 2L)).millis
         )
@@ -245,7 +287,7 @@ object LocalSite:
     private def localRelease: Either[ValidationFailure, WorkerRelease] =
       WorkerReleaseId
         .from("local-in-process")
-        .map(id => WorkerRelease(id, AtomicFiles.digestOf(Vector.empty)))
+        .map(id => WorkerRelease(id, AtomicFiles.digestOf(ByteVectors.of(Vector.empty))))
 
     private def spoolLimits: Either[ValidationFailure, SpoolLimits] =
       ByteLimit
@@ -315,7 +357,9 @@ object LocalSite:
             .map(failure =>
               OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}")
             )
-            .map(bytes => PreparedInput.Carried(bytes, AtomicFiles.digestOf(bytes)))
+            .map(bytes =>
+              PreparedInput.Carried(ByteVectors.toVector(bytes), AtomicFiles.digestOf(bytes))
+            )
         case TaskInput.Stored(ref) =>
           Right(PreparedInput.Referenced(ref.path, ref.digest))
 
@@ -328,34 +372,55 @@ object LocalSite:
       val identity = prepared match
         case PreparedInput.Carried(_, digest)    => digest
         case PreparedInput.Referenced(_, digest) => digest
+      val proposed = RequestFingerprint.compute(op, identity)
       for
-        isClosed <- closed.get
         phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
-        outcome <- Deferred[IO, TaskOutcome[Nothing]]
+        outcome <- Deferred[IO, TaskResult[Nothing]]
         cancelRequested <- Deferred[IO, Unit]
-        candidate =
-          LocalTask(op.descriptor, identity, op.artifacts, phase, outcome, cancelRequested)
-        decision <-
-          if isClosed then IO.pure(Left(SubmitRejection.Closed))
-          else
-            tasks.modify { current =>
-              current.get(key) match
-                case Some(existing)
-                    if existing.descriptor == op.descriptor &&
-                      existing.inputIdentity == identity &&
-                      existing.artifacts == op.artifacts =>
-                  (current, Right(existing))
-                case Some(_) => (current, Left(SubmitRejection.Conflict(key)))
-                case None    => (current.updated(key, candidate), Right(candidate))
-            }
-        handle <- decision match
+        startedAt <- IO.realTimeInstant
+        attemptId <- mintAttemptId(key)
+        handle <- attemptId match
           case Left(rejection) => IO.pure(Left(rejection))
-          case Right(task)     =>
-            val start =
-              if task eq candidate then
-                supervisor.supervise(execute(registered, prepared, task)).void
-              else IO.unit
-            start.as(Right(taskHandle[O](key, task)))
+          case Right(minted)   =>
+            val candidate =
+              LocalTask(proposed, phase, outcome, cancelRequested, minted, startedAt)
+            IO.uncancelable { _ =>
+              closed.get.flatMap { isClosed =>
+                if isClosed then IO.pure(Left(SubmitRejection.Closed))
+                else
+                  tasks
+                    .modify { current =>
+                      current.get(key) match
+                        case Some(existing) if existing.fingerprint == proposed =>
+                          (current, Right(existing))
+                        case Some(existing) =>
+                          (
+                            current,
+                            Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed))
+                          )
+                        case None => (current.updated(key, candidate), Right(candidate))
+                    }
+                    .flatMap {
+                      case Left(rejection)                  => IO.pure(Left(rejection))
+                      case Right(task) if task eq candidate =>
+                        // Post-insert closed recheck (parity with pool): withdraw if release won.
+                        closed.get.flatMap {
+                          case true =>
+                            tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                          case false => IO.pure(Right(task))
+                        }
+                      case Right(task) => IO.pure(Right(task))
+                    }
+              }
+            }.flatMap {
+              case Left(rejection) => IO.pure(Left(rejection))
+              case Right(task)     =>
+                val start =
+                  if task eq candidate then
+                    supervisor.supervise(execute(registered, prepared, task)).void
+                  else IO.unit
+                start.as(Right(taskHandle[O](key, task)))
+            }
       yield handle
 
     private def execute(
@@ -365,7 +430,7 @@ object LocalSite:
     ): IO[Unit] =
       val work: IO[TaskOutcome[Nothing]] =
         for
-          _ <- task.phase.set(TaskPhase.Running)
+          _ <- task.phase.update(TaskPhase.advance(_, TaskPhase.Running))
           inputBytes <- prepared match
             case PreparedInput.Carried(bytes, _)        => IO.pure(Right(bytes))
             case PreparedInput.Referenced(path, digest) =>
@@ -387,13 +452,15 @@ object LocalSite:
               for
                 publisher <- ArtifactPublisher.create[IO](fsStore, registered.artifacts)
                 executed <- registered.runWithContext(
-                  bytes,
+                  ByteVectors.of(bytes),
                   OperationContext(publisher)
                 )
                 result <- executed match
                   case Left(failure)      => IO.pure(failed(failure): TaskOutcome[Nothing])
                   case Right(resultBytes) =>
-                    publisher.finish.flatMap(publish(registered, resultBytes, _))
+                    publisher.finish.flatMap(
+                      publish(registered, ByteVectors.toVector(resultBytes), _)
+                    )
               yield result
         yield outcome
 
@@ -419,9 +486,36 @@ object LocalSite:
             )
           )
         )
-        .flatMap { result =>
-          task.phase.set(TaskPhase.Settled) *> task.outcome.complete(result).void
+        .guaranteeCase {
+          case Outcome.Succeeded(fa) =>
+            fa.flatMap(result => settleLocal(task, result))
+          case Outcome.Errored(error) =>
+            settleLocal(
+              task,
+              TaskOutcome.Failed(
+                FailureDiagnosis(
+                  FailureCause.RuntimeError(
+                    Option(error.getMessage).getOrElse(error.getClass.getSimpleName)
+                  ),
+                  Vector.empty,
+                  Vector.empty
+                )
+              )
+            )
+          case Outcome.Canceled() =>
+            settleLocal(
+              task,
+              TaskOutcome.Unknown(
+                Diagnostics.one(
+                  Diagnostic(
+                    "site-closed",
+                    "the task fiber was cancelled before a terminal outcome was observed"
+                  )
+                )
+              )
+            )
         }
+        .void
 
     private def publish(
         registered: RegisteredOperation[IO],
@@ -503,9 +597,17 @@ object LocalSite:
       */
     private def storeFailureCodes(failure: StoreFailure): Vector[String] =
       failure match
-        case StoreFailure.NotFound(path) => Vector("not-found", path.value)
+        case StoreFailure.NotFound(path)                  => Vector("not-found", path.value)
+        case StoreFailure.ForeignSite(expected, observed) =>
+          Vector("foreign-site", expected.value, observed.value)
+        case StoreFailure.SchemaMismatch(expected, observed) =>
+          Vector("schema-mismatch", expected.value, observed.value)
         case StoreFailure.DigestMismatch(path, expected, observed) =>
           Vector("digest-mismatch", path.value, expected.value, observed.value)
+        case StoreFailure.Corrupt(path, detail) =>
+          Vector("corrupt", path.value, detail)
+        case StoreFailure.TooLarge(size, limit) =>
+          Vector("too-large", size.toString, limit.toString)
         case StoreFailure.Decode(codecFailure) =>
           Vector("decode", codecFailure.code, codecFailure.message)
         case StoreFailure.Io(diagnostics) =>
@@ -519,6 +621,41 @@ object LocalSite:
         case OperationRunFailure.Execution(code, message) => s"$code: $message"
         case OperationRunFailure.InvalidResult(detail)    => detail
 
+    private def mintAttemptId(key: SubmissionKey): IO[Either[SubmitRejection, AttemptId]] =
+      IO(UUID.randomUUID().toString.toLowerCase).map { uuid =>
+        AttemptId
+          .from(s"${key.value}-a$uuid")
+          .left
+          .map(failure => SubmitRejection.InvalidInput(failure))
+      }
+
+    private def settleLocal(task: LocalTask, outcome: TaskOutcome[Nothing]): IO[Unit] =
+      IO.realTimeInstant.flatMap { finishedAt =>
+        val attempt = AttemptRecord(
+          attemptId = task.attemptId,
+          epoch = AttemptEpoch.initial,
+          startedAt = Some(task.startedAt),
+          finishedAt = Some(finishedAt),
+          worker = None,
+          allocation = None,
+          interruption = TaskReport.interruptionOf(outcome),
+          indeterminacy = TaskReport.indeterminacyOf(outcome)
+        )
+        task.phase.update(TaskPhase.advance(_, TaskPhase.Settled)) *>
+          task.outcome
+            .complete(
+              TaskResult(
+                outcome,
+                TaskReport.fromOutcome(
+                  outcome,
+                  requestFingerprint = Some(task.fingerprint),
+                  attempts = Vector(attempt)
+                )
+              )
+            )
+            .void
+      }
+
     private def taskHandle[O](submissionKey: SubmissionKey, task: LocalTask): TaskHandle[IO, O] =
       new TaskHandle[IO, O]:
         def key: SubmissionKey = submissionKey
@@ -530,6 +667,9 @@ object LocalSite:
           yield TaskStatus(phase, Freshness.Current(now))
 
         def await: IO[TaskOutcome[O]] =
-          task.outcome.get.map(outcome => outcome: TaskOutcome[O])
+          task.outcome.get.map(result => result.outcome: TaskOutcome[O])
+
+        def awaitResult: IO[TaskResult[O]] =
+          task.outcome.get.map(result => TaskResult(result.outcome: TaskOutcome[O], result.report))
 
         def cancel: IO[Unit] = task.cancelRequested.complete(()).void

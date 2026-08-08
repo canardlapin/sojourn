@@ -5,13 +5,14 @@ import cats.effect.IO
 import cats.effect.std.Console
 import io.github.bbuchsbaum.remoteexec.kernel.ByteLimit
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerRelease
-import io.github.bbuchsbaum.scalaslurm.protocol.TaskInvocationCodec
-import io.github.bbuchsbaum.scalaslurm.worker.FileResultPublisher
-import io.github.bbuchsbaum.scalaslurm.worker.FileTaskContext
-import io.github.bbuchsbaum.scalaslurm.worker.FileTaskWorkspace
-import io.github.bbuchsbaum.scalaslurm.worker.FileWorkerEventSink
-import io.github.bbuchsbaum.scalaslurm.worker.WorkerRunResult
-import io.github.bbuchsbaum.scalaslurm.worker.WorkerRuntime
+import io.github.bbuchsbaum.slurm4s.protocol.TaskInvocationCodec
+import io.github.bbuchsbaum.slurm4s.worker.FileResultPublisher
+import io.github.bbuchsbaum.slurm4s.worker.FileTaskContext
+import io.github.bbuchsbaum.slurm4s.worker.FileTaskWorkspace
+import io.github.bbuchsbaum.slurm4s.worker.FileWorkerEventSink
+import io.github.bbuchsbaum.slurm4s.worker.WorkerRunResult
+import io.github.bbuchsbaum.slurm4s.worker.WorkerRuntime
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoop
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotLoopConfig
 import io.github.bbuchsbaum.sojourn.runtime.spool.PilotStopCause
@@ -173,8 +174,8 @@ object SojournEntryPoint:
           size <- IO.blocking(JFiles.size(arguments.invocation))
           bytes <-
             if size > limits.maximumInvocationBytes.value.toLong then
-              IO.pure(Vector.empty[Byte]) // refused below by the codec's own bound
-            else IO.blocking(JFiles.readAllBytes(arguments.invocation).toVector)
+              IO.pure(ByteVectors.of(Vector.empty[Byte]))
+            else IO.blocking(ByteVectors.of(JFiles.readAllBytes(arguments.invocation)))
           outcome <- TaskInvocationCodec.decode(
             bytes,
             limits.maximumInvocationBytes,

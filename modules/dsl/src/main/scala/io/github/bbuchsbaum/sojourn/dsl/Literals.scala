@@ -1,6 +1,6 @@
 package io.github.bbuchsbaum.sojourn.dsl
 
-import io.github.bbuchsbaum.scalaslurm.core.SubmissionKey
+import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.sojourn.SiteName
 
 import scala.quoted.*

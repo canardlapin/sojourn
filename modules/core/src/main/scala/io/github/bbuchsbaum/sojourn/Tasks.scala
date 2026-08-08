@@ -1,6 +1,5 @@
 package io.github.bbuchsbaum.sojourn
 
-import cats.effect.Resource
 import io.github.bbuchsbaum.remoteexec.kernel.ContentDigest
 import io.github.bbuchsbaum.remoteexec.kernel.Diagnostics
 import io.github.bbuchsbaum.remoteexec.kernel.FailureDiagnosis
@@ -13,12 +12,43 @@ import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 
-/** Coarse lifecycle phase of a task as last observed. */
+/** Coarse lifecycle phase of a task as last observed.
+  *
+  * Monotone order: [[Queued]] → [[Dispatched]] → [[Running]] → [[Settled]]. Backends may skip
+  * intermediate phases but must never move backwards (see [[TaskPhase.advance]]).
+  *
+  * Lifecycle projection (plan 3.8): Queued ≡ Admitted, Dispatched|Running ≡ Active, Settled ≡
+  * Terminal.
+  */
 enum TaskPhase derives CanEqual:
   case Queued
   case Dispatched
   case Running
   case Settled
+
+object TaskPhase:
+  /** Total order used to enforce monotone advances. */
+  def rank(phase: TaskPhase): Int = phase match
+    case Queued     => 0
+    case Dispatched => 1
+    case Running    => 2
+    case Settled    => 3
+
+  /** Advance to `proposed` only if it does not regress; otherwise keep `current`. */
+  def advance(current: TaskPhase, proposed: TaskPhase): TaskPhase =
+    if rank(proposed) >= rank(current) then proposed else current
+
+  /** Coarse Admitted / Active / Terminal projection. */
+  def lifecycle(phase: TaskPhase): TaskLifecycle = phase match
+    case Queued               => TaskLifecycle.Admitted
+    case Dispatched | Running => TaskLifecycle.Active
+    case Settled              => TaskLifecycle.Terminal
+
+/** Monotone coarse lifecycle (plan 3.8). [[TaskPhase]] remains the detailed observation surface. */
+enum TaskLifecycle derives CanEqual:
+  case Admitted
+  case Active
+  case Terminal
 
 /** A task's observed [[TaskPhase]] together with how fresh that observation is. */
 final case class TaskStatus(phase: TaskPhase, freshness: Freshness) derives CanEqual
@@ -52,10 +82,15 @@ enum SubmitRejection derives CanEqual:
   case UnknownOperation(id: OperationId)
   case InvalidInput(failure: ValidationFailure)
 
-  /** The key was already submitted with a different operation or input; the original task is
-    * untouched and the caller must pick a fresh key (or attach to the original).
+  /** The key was already submitted with a different logical request; the original task is
+    * untouched. Both fingerprints are reported so callers can see existing vs proposed identity
+    * without guessing. Pick a fresh key, or attach to the original when attachment is available.
     */
-  case Conflict(key: SubmissionKey)
+  case Conflict(
+      key: SubmissionKey,
+      existing: RequestFingerprint,
+      proposed: RequestFingerprint
+  )
   case Closed
 
 /** A live handle to a submitted task. */
@@ -68,6 +103,9 @@ trait TaskHandle[F[_], O]:
 
   /** Completes with the terminal [[TaskOutcome]] once the task settles. */
   def await: F[TaskOutcome[O]]
+
+  /** Completes with outcome plus [[TaskReport]] provenance once the task settles. */
+  def awaitResult: F[TaskResult[O]]
 
   /** Request cancellation. Best-effort and observational: the request is delivered, and the
     * terminal outcome still arrives through [[await]] — typically as [[TaskOutcome.Interrupted]],
@@ -91,13 +129,21 @@ trait LeasedPool[F[_]] extends TaskRunner[F]:
 /** Why a store operation could not be completed.
   *
   *   - [[NotFound]]: nothing exists at `path`.
+  *   - [[ForeignSite]]: the reference names a different site than this store.
+  *   - [[SchemaMismatch]]: the reference schema does not match the codec / expected schema.
   *   - [[DigestMismatch]]: the stored bytes no longer hash to the reference digest.
+  *   - [[Corrupt]]: an existing object failed CAS verification (wrong type/size/digest).
+  *   - [[TooLarge]]: the object exceeds the store bound.
   *   - [[Decode]]: the bytes were present but the codec rejected them.
   *   - [[Io]]: an underlying storage fault, with observed evidence.
   */
 enum StoreFailure derives CanEqual:
   case NotFound(path: SitePath)
+  case ForeignSite(expected: SiteName, observed: SiteName)
+  case SchemaMismatch(expected: SchemaId, observed: SchemaId)
   case DigestMismatch(path: SitePath, expected: ContentDigest, observed: ContentDigest)
+  case Corrupt(path: SitePath, detail: String)
+  case TooLarge(size: Long, limit: Long)
   case Decode(failure: ResultCodecFailure)
   case Io(diagnostics: Diagnostics)
 
@@ -137,24 +183,22 @@ trait SiteStore[F[_]]:
       schema: SchemaId
   ): F[Either[StoreFailure, RemoteRef[Vector[Byte]]]]
 
-  /** Stream the raw bytes named by `ref`. The digest is verified before the first byte is emitted;
-    * a mismatch fails the stream's effect with a typed [[StoreFailure]] via the returned effect
-    * boundary, never with partially-yielded corrupt data.
+  /** Stream the raw bytes named by `ref` in one pass (O(chunk) memory). The digest is verified
+    * after the last byte; a mismatch fails the stream with [[StoreStreamFailure]] — a prefix may
+    * already have been emitted. Prefer [[readVerified]] when the whole object must be checked
+    * before any byte is observed.
     */
   def fetchStream[A](ref: RemoteRef[A]): fs2.Stream[F, Byte]
 
+  /** Materialize and digest-verify the whole object before returning any bytes. */
+  def readVerified[A](ref: RemoteRef[A]): F[Either[StoreFailure, Vector[Byte]]]
+
+  /** Chunk-manifest / Merkle verified streaming — stub in M3; GiB path lands in M4. */
+  def streamVerifiedChunks[A](ref: RemoteRef[A]): fs2.Stream[F, Byte]
+
 /** A scheduler-neutral compute and data facade for one site.
   *
-  * `batch` runs tasks directly against the underlying scheduler; `pool` acquires a leased pilot
-  * pool as a `Resource` so acquisition, lease, and release are lexically scoped and revocation is
-  * observable through the pool's [[LeaseState]].
+  * Prefer the capability split in [[Site]] / [[PoolCapableSite]] (see `Capabilities.scala`). This
+  * file keeps [[TaskRunner]], [[SiteStore]], and outcomes. Historical `Site.pool` has moved to
+  * [[PoolCapableSite.pools]].
   */
-trait Site[F[_]]:
-  def name: SiteName
-
-  /** The operations this site can execute; [[TaskRunner.submit]] refuses anything outside it. */
-  def operations: OperationCatalog
-
-  def store: SiteStore[F]
-  def batch: TaskRunner[F]
-  def pool(spec: PoolSpec): Resource[F, LeasedPool[F]]

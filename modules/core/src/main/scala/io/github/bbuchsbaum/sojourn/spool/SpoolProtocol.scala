@@ -14,6 +14,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
+import io.github.bbuchsbaum.sojourn.CatalogFingerprint
+import io.github.bbuchsbaum.sojourn.RequestFingerprint
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath
 import io.github.bbuchsbaum.sojourn.SiteText
@@ -25,6 +27,8 @@ import java.time.Instant
   */
 object PilotId:
   opaque type Type = String
+
+  given CanEqual[Type, Type] = CanEqual.derived
 
   def from(raw: String): Either[ValidationFailure, Type] =
     SiteText.token("pilotId", raw, 128)
@@ -210,6 +214,11 @@ enum SpoolInput derives CanEqual:
   * `attemptEpoch` must equal the epoch in the carrying filename (readers verify); `retrySafety`
   * travels with the work so reclaim policy and the result envelope can echo its provenance;
   * `publishedAt` is dispatcher-clock evidence, never compared against pilot clocks.
+  *
+  * Identity binding (M3): `requestFingerprint` is the site admission digest; `catalogFingerprint`,
+  * `releaseDigest`, and `manifestDigest` bind the worker Program, staged worker bytes, and pool
+  * manifest the dispatcher expects. Pilots echo these onto [[SpoolResult]]; the dispatcher settles
+  * only when every field matches.
   */
 final case class SpoolInvocation(
     key: SubmissionKey,
@@ -220,6 +229,10 @@ final case class SpoolInvocation(
     inputSchema: SchemaId,
     resultSchema: ResultSchemaId,
     retrySafety: RetrySafety,
+    requestFingerprint: RequestFingerprint,
+    catalogFingerprint: CatalogFingerprint,
+    releaseDigest: ContentDigest,
+    manifestDigest: ContentDigest,
     limits: SpoolLimits,
     publishedAt: Instant,
     input: SpoolInput
@@ -255,6 +268,10 @@ final case class SpoolResult(
     resultSchema: ResultSchemaId,
     pilot: PilotId,
     release: WorkerReleaseId,
+    releaseDigest: ContentDigest,
+    requestFingerprint: RequestFingerprint,
+    catalogFingerprint: CatalogFingerprint,
+    manifestDigest: ContentDigest,
     retrySafety: RetrySafety,
     startedAt: Instant,
     finishedAt: Instant,

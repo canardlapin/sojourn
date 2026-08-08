@@ -11,11 +11,11 @@ filesystem.
 | Owner | Responsibility |
 | --- | --- |
 | `sojourn-core` | Logical artifact paths, declarations, byte schemas, media types, durable references, complete artifact sets, and publication failures |
-| `scala-slurm` | Worker output workspace, declared-path enforcement, bounded writes, sealing, size/digest manifests, attempt fencing, and verified result attachment |
+| `slurm4s` | Worker output workspace, declared-path enforcement, bounded writes, sealing, size/digest manifests, attempt fencing, and verified result attachment |
 | `sojourn-slurm` | Lower declarations, independently observe sealed files, import them into `SiteStore`, and compare the imported size/digest |
 | `sojourn-runtime` | Content-addressed promotion and all-or-nothing publication of the artifact set |
 
-`ArtifactPath` and scala-slurm's `RelativeOutputPath` are structurally similar but have different
+`ArtifactPath` and slurm4s's `RelativeOutputPath` are structurally similar but have different
 authority. The former is a pipeline contract; the latter is a path capability scoped to one worker
 workspace. The adapter performs the explicit lowering.
 

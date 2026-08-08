@@ -27,10 +27,17 @@ object SpoolEvidence:
     * travels; it is never flattened to a fixed string.
     */
   def storeFailureCodes(failure: StoreFailure): Vector[String] = failure match
-    case StoreFailure.NotFound(path)                           => Vector("not-found", path.value)
+    case StoreFailure.NotFound(path)                  => Vector("not-found", path.value)
+    case StoreFailure.ForeignSite(expected, observed) =>
+      Vector("foreign-site", expected.value, observed.value)
+    case StoreFailure.SchemaMismatch(expected, observed) =>
+      Vector("schema-mismatch", expected.value, observed.value)
     case StoreFailure.DigestMismatch(path, expected, observed) =>
       Vector("digest-mismatch", path.value, expected.value, observed.value)
+    case StoreFailure.Corrupt(path, detail) => Vector("corrupt", path.value, detail)
+    case StoreFailure.TooLarge(size, limit) =>
+      Vector("too-large", size.toString, limit.toString)
     case StoreFailure.Decode(codecFailure) =>
       Vector("decode", codecFailure.code, codecFailure.message)
     case StoreFailure.Io(diagnostics) =>
-      diagnostics.toVector.flatMap(diagnostic => Vector(diagnostic.code, diagnostic.message))
+      diagnostics.values.toVector.flatMap(diagnostic => Vector(diagnostic.code, diagnostic.message))

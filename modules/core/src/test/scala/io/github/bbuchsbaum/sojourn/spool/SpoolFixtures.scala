@@ -13,6 +13,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
 import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
+import io.github.bbuchsbaum.sojourn.CatalogFingerprint
+import io.github.bbuchsbaum.sojourn.RequestFingerprint
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath
 
@@ -25,10 +27,24 @@ import java.util.Base64
   * followed by a single `\n`. It was produced by running [[SpoolFixtureGen]] and is asserted
   * byte-for-byte by `SpoolCodecSuite`; regenerate it with the same command if the canonical format
   * ever changes (a visible, reviewed diff — never a silent drift). v1-rev2 (2026-07-24):
-  * regenerated for the epoch/identity/result-plane additions; v1 was never deployed.
+  * regenerated for the epoch/identity/result-plane additions; v1 was never deployed. v1-rev3
+  * (2026-08-04): request/catalog/release/manifest digests on invocation and result.
   */
 object SpoolFixtures:
   private val newline: Vector[Byte] = Vector('\n'.toByte)
+
+  private def digest(suffix: Char): ContentDigest =
+    ContentDigest
+      .from(s"sha256:${"0" * 63}$suffix")
+      .toOption
+      .get
+
+  val fixtureRequestFingerprint: RequestFingerprint =
+    RequestFingerprint.fromDigest(digest('1'))
+  val fixtureCatalogFingerprint: CatalogFingerprint =
+    CatalogFingerprint.fromDigest(digest('2'))
+  val fixtureReleaseDigest: ContentDigest = digest('3')
+  val fixtureManifestDigest: ContentDigest = digest('4')
 
   val limits: SpoolLimits = SpoolLimits(
     maximumInlineInputBytes = ByteLimit.maximumCommandCapture,
@@ -84,6 +100,10 @@ object SpoolFixtures:
     SchemaId.from("example.input.v1").toOption.get,
     ResultSchemaId.from("example.output.v1").toOption.get,
     RetrySafety.SafeForAutomaticRetry,
+    fixtureRequestFingerprint,
+    fixtureCatalogFingerprint,
+    fixtureReleaseDigest,
+    fixtureManifestDigest,
     limits,
     Instant.parse("2026-07-23T08:04:30Z"),
     SpoolInput.InlineBase64("hello spool".getBytes("UTF-8").toVector)
@@ -98,11 +118,18 @@ object SpoolFixtures:
     SchemaId.from("example.input.v1").toOption.get,
     ResultSchemaId.from("example.output.v1").toOption.get,
     RetrySafety.NoAutomaticRetry,
+    fixtureRequestFingerprint,
+    fixtureCatalogFingerprint,
+    fixtureReleaseDigest,
+    fixtureManifestDigest,
     limits,
     Instant.parse("2026-07-23T08:07:00Z"),
     SpoolInput.Stored(
       SitePath.from("inputs/submit-99/value.bin").toOption.get,
-      ContentDigest.from("sha256:abcdef").toOption.get
+      ContentDigest
+        .from("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+        .toOption
+        .get
     )
   )
 
@@ -115,12 +142,19 @@ object SpoolFixtures:
     ResultSchemaId.from("example.output.v1").toOption.get,
     PilotId.from("pilot-alpha.01").toOption.get,
     WorkerReleaseId.from("worker-release-1").toOption.get,
+    fixtureReleaseDigest,
+    fixtureRequestFingerprint,
+    fixtureCatalogFingerprint,
+    fixtureManifestDigest,
     RetrySafety.SafeForAutomaticRetry,
     Instant.parse("2026-07-23T08:05:10Z"),
     Instant.parse("2026-07-23T08:05:42Z"),
     SpoolResultStatus.Succeeded(
       SitePath.from("objects/ab/abcdef0123").toOption.get,
-      ContentDigest.from("sha256:abcdef0123").toOption.get
+      ContentDigest
+        .from("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+        .toOption
+        .get
     )
   )
 

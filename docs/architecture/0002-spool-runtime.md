@@ -122,7 +122,7 @@ retry (`retry(key, expectedEpoch, Manual)`) mints a new epoch and a NEW handle.
   pool release, dispatcher-side deadline−drainGrace, manual.
 - Pilot stops claiming at the earliest of: marker observed (checked between claims and at
   heartbeat cadence) / own `deadline − drainGrace` (pilot-local clocks — no skew issue) /
-  the pre-deadline signal (**deferred until scala-slurm P6f.23 lands**; the marker and the
+  the pre-deadline signal (**deferred until slurm4s P6f.23 lands**; the marker and the
   local deadline rule are the v1 stop conditions).
 - In-flight claim at drain with time remaining: finish, publish, release, final heartbeat
   `draining`, exit 0. At the signal (post-P6f.23): cancel the task fiber cooperatively, publish
@@ -220,7 +220,7 @@ dropped at settlement (it remains observable beforehand through the status/fresh
 
 ## Deferred integrations (recorded)
 
-- **Pre-deadline signal stop condition** — needs scala-slurm P6f.23 (`SignalSpec`,
+- **Pre-deadline signal stop condition** — needs slurm4s P6f.23 (`SignalSpec`,
   `terminationNotice`, `--signal` lowering, worker drain-notice adapter).
 - **`Site.attach` / pool reconstitution** — needs P6f.25 (`SubmissionKey.derive`,
   `ControlStore.byKeyPrefix`); the reclaim tombstone re-scan (race 8) is designed for it.

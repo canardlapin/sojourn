@@ -1,0 +1,1 @@
+{"actor":"sojourn-1-0","entity":"bd-01KZ6RM1A117Z98W26BN4JT9HY","kind":"reserve_open","mode":"exclusive","op":"20260804T161616.851534Z-p66863-c0000-r9182-hc3a3d7","paths":["modules/local/src/main/scala/io/github/bbuchsbaum/sojourn/local/LocalSite.scala"],"reservation_id":"rv-01KZ6RZEYKVKESMM5KMF6FE4W1","ts":"2026-08-04T16:16:16.851534Z","ttl_s":3600,"v":1}

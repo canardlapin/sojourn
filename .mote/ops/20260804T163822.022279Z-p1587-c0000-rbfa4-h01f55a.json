@@ -1,0 +1,1 @@
+{"actor":"sojourn-1-0","entity":"bd-01KZ6T7X26SAVYE4VHT4ARRAG5","kind":"create","op":"20260804T163822.022279Z-p1587-c0000-rbfa4-h01f55a","set":{"priority":1,"status":"open","title":"M3: Streaming control-plane (no toVector; fetchStream O(chunk))"},"ts":"2026-08-04T16:38:22.022279Z","v":1}

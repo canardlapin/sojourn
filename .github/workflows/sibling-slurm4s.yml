@@ -1,0 +1,61 @@
+# Optional sibling integration against an unreleased slurm4s SHA.
+#
+# Default CI (ci.yml) now publishLocals the same pin before `sbt +update` until
+# remote-exec-kernel / slurm4s-* 0.1.0 reach Maven Central (M0). Keep this
+# workflow for SHA bumps and as a focused integration lane.
+
+name: Sibling slurm4s integration
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'slurm4s.sha'
+      - 'project/Dependencies.scala'
+      - 'build.sbt'
+      - '.github/workflows/sibling-slurm4s.yml'
+      - '.github/workflows/ci.yml'
+
+jobs:
+  sibling:
+    name: Build against pinned slurm4s source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sojourn
+        uses: actions/checkout@v6
+
+      - name: Checkout slurm4s at pin
+        uses: actions/checkout@v6
+        with:
+          repository: canardlapin/slurm4s
+          ref: ${{ github.event.inputs.ref || '' }}
+          path: slurm4s-src
+
+      - name: Pin checkout
+        run: |
+          pin="$(cat slurm4s.sha)"
+          git -C slurm4s-src fetch --depth 1 origin "$pin"
+          git -C slurm4s-src checkout "$pin"
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: sbt
+
+      - name: Publish pinned slurm4s 0.1.0 locally
+        working-directory: slurm4s-src
+        run: |
+          sbt -batch \
+            'set ThisBuild/version := "0.1.0"' \
+            'set ThisBuild/isSnapshot := false' \
+            '++ 3.7.4' \
+            publishLocal
+
+      - name: Sojourn boundaries + test
+        run: sbt -batch checkModuleBoundaries test

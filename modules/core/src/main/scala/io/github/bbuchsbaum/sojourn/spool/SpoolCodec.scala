@@ -18,6 +18,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.SchemaId
 import io.github.bbuchsbaum.remoteexec.kernel.SubmissionKey
 import io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure
 import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
+import io.github.bbuchsbaum.sojourn.CatalogFingerprint
+import io.github.bbuchsbaum.sojourn.RequestFingerprint
 import io.github.bbuchsbaum.sojourn.SiteName
 import io.github.bbuchsbaum.sojourn.SitePath
 
@@ -130,8 +132,9 @@ object SpoolCodec:
       _ <- Either.cond(sequence >= 0L, (), Malformed("field 'sequence' must not be negative"))
       state <- stringField(obj, "state").flatMap(pilotStateFrom)
       claimed <- obj("claimed") match
-        case None | Some(Json.Null) => Right(None)
-        case Some(value)            =>
+        case None                        => Right(None)
+        case Some(value) if value.isNull => Right(None)
+        case Some(value)                 =>
           for
             claimObj <- value.asObject.toRight(Malformed("field 'claimed' must be an object"))
             key <- identifier(claimObj, "key", SubmissionKey.from)
@@ -154,6 +157,10 @@ object SpoolCodec:
         "inputSchema" -> Json.fromString(message.inputSchema.value),
         "resultSchema" -> Json.fromString(message.resultSchema.value),
         "retrySafety" -> Json.fromString(retrySafetyText(message.retrySafety)),
+        "requestFingerprint" -> Json.fromString(message.requestFingerprint.value),
+        "catalogFingerprint" -> Json.fromString(message.catalogFingerprint.value),
+        "releaseDigest" -> Json.fromString(message.releaseDigest.value),
+        "manifestDigest" -> Json.fromString(message.manifestDigest.value),
         "limits" -> encodeLimits(message.limits),
         "publishedAt" -> Json.fromString(message.publishedAt.toString),
         "input" -> encodeInput(message.input)
@@ -173,6 +180,10 @@ object SpoolCodec:
       inputSchema <- identifier(obj, "inputSchema", SchemaId.from)
       resultSchema <- identifier(obj, "resultSchema", ResultSchemaId.from)
       retrySafety <- stringField(obj, "retrySafety").flatMap(retrySafetyFrom)
+      requestFingerprint <- identifier(obj, "requestFingerprint", RequestFingerprint.parse)
+      catalogFingerprint <- identifier(obj, "catalogFingerprint", CatalogFingerprint.parse)
+      releaseDigest <- identifier(obj, "releaseDigest", ContentDigest.from)
+      manifestDigest <- identifier(obj, "manifestDigest", ContentDigest.from)
       limits <- obj("limits")
         .toRight(Malformed("missing object field 'limits'"))
         .flatMap(decodeLimits)
@@ -188,6 +199,10 @@ object SpoolCodec:
       inputSchema,
       resultSchema,
       retrySafety,
+      requestFingerprint,
+      catalogFingerprint,
+      releaseDigest,
+      manifestDigest,
       limits,
       publishedAt,
       input
@@ -208,6 +223,10 @@ object SpoolCodec:
         "resultSchema" -> Json.fromString(message.resultSchema.value),
         "pilot" -> Json.fromString(message.pilot.value),
         "release" -> Json.fromString(message.release.value),
+        "releaseDigest" -> Json.fromString(message.releaseDigest.value),
+        "requestFingerprint" -> Json.fromString(message.requestFingerprint.value),
+        "catalogFingerprint" -> Json.fromString(message.catalogFingerprint.value),
+        "manifestDigest" -> Json.fromString(message.manifestDigest.value),
         "retrySafety" -> Json.fromString(retrySafetyText(message.retrySafety)),
         "startedAt" -> Json.fromString(message.startedAt.toString),
         "finishedAt" -> Json.fromString(message.finishedAt.toString),
@@ -228,11 +247,20 @@ object SpoolCodec:
       resultSchema <- identifier(obj, "resultSchema", ResultSchemaId.from)
       pilot <- identifier(obj, "pilot", PilotId.from)
       release <- identifier(obj, "release", WorkerReleaseId.from)
+      releaseDigest <- identifier(obj, "releaseDigest", ContentDigest.from)
+      requestFingerprint <- identifier(obj, "requestFingerprint", RequestFingerprint.parse)
+      catalogFingerprint <- identifier(obj, "catalogFingerprint", CatalogFingerprint.parse)
+      manifestDigest <- identifier(obj, "manifestDigest", ContentDigest.from)
       retrySafety <- stringField(obj, "retrySafety").flatMap(retrySafetyFrom)
       startedAt <- instantField(obj, "startedAt")
       finishedAt <- instantField(obj, "finishedAt")
       statusJson <- obj("status").toRight(Malformed("missing object field 'status'"))
       status <- decodeStatus(statusJson)
+      _ <- Either.cond(
+        !finishedAt.isBefore(startedAt),
+        (),
+        Malformed("field 'finishedAt' must not precede 'startedAt'")
+      )
     yield SpoolResult(
       key,
       attemptId,
@@ -242,6 +270,10 @@ object SpoolCodec:
       resultSchema,
       pilot,
       release,
+      releaseDigest,
+      requestFingerprint,
+      catalogFingerprint,
+      manifestDigest,
       retrySafety,
       startedAt,
       finishedAt,
@@ -277,6 +309,11 @@ object SpoolCodec:
       )
       minReady <- intField(obj, "minReady").flatMap(raw =>
         PositiveInt.from("minReady", raw).left.map(Invalid.apply)
+      )
+      _ <- Either.cond(
+        minReady.toInt <= pilots.toInt,
+        (),
+        Malformed("field 'minReady' must not exceed 'pilots'")
       )
       heartbeat <- longField(obj, "heartbeatEveryMillis").flatMap(raw =>
         DurationMillis.from(raw).left.map(Invalid.apply)
@@ -508,8 +545,9 @@ object SpoolCodec:
       name: String
   ): Either[SpoolCodecFailure, Option[String]] =
     obj(name) match
-      case None | Some(Json.Null) => Right(None)
-      case Some(value)            =>
+      case None                        => Right(None)
+      case Some(value) if value.isNull => Right(None)
+      case Some(value)                 =>
         value.asString.map(Some(_)).toRight(Malformed(s"field '$name' must be a string"))
 
   private def longField(obj: JsonObject, name: String): Either[SpoolCodecFailure, Long] =

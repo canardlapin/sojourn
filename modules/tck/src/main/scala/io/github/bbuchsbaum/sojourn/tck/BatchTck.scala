@@ -71,7 +71,7 @@ abstract class BatchTck extends CatsEffectSuite:
     yield assertEquals(status.phase, TaskPhase.Settled)
   }
 
-  test("law B3: resubmitting the same key and request observes one execution") {
+  test("law B3: one logical admission under duplicate client submission") {
     val h = siteFixture()
     val key = freshKey("b3")
     for
@@ -90,7 +90,7 @@ abstract class BatchTck extends CatsEffectSuite:
       assertEquals(after - before, 1L)
   }
 
-  test("law B4: the same key with a different request is a Conflict") {
+  test("law B4: the same key with a different request is a Conflict with both fingerprints") {
     val h = siteFixture()
     val key = freshKey("b4")
     for
@@ -99,8 +99,10 @@ abstract class BatchTck extends CatsEffectSuite:
         .map(_.toOption.get)
       conflicted <- h.site.batch.submit(h.echo, TaskInput.Inline("different"), key)
     yield conflicted match
-      case Left(SubmitRejection.Conflict(observed)) => assertEquals(observed, key)
-      case other                                    => fail(s"expected Conflict, observed $other")
+      case Left(SubmitRejection.Conflict(observed, existing, proposed)) =>
+        assertEquals(observed, key)
+        assertNotEquals(existing, proposed)
+      case other => fail(s"expected Conflict, observed $other")
   }
 
   test("law B5: a failing operation settles as Failed — never an escaped exception") {

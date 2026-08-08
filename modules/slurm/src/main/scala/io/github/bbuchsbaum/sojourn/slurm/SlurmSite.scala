@@ -10,27 +10,29 @@ import cats.effect.std.Supervisor
 import fs2.io.file.Files as Fs2Files
 import fs2.io.file.Path as Fs2Path
 import fs2.io.process.Processes
-import io.github.bbuchsbaum.scalaslurm.core.*
-import io.github.bbuchsbaum.scalaslurm.local.SlurmLocal
-import io.github.bbuchsbaum.scalaslurm.local.SlurmLocalConfig
-import io.github.bbuchsbaum.scalaslurm.managed.Managed
-import io.github.bbuchsbaum.scalaslurm.managed.ManagedAttempt
-import io.github.bbuchsbaum.scalaslurm.managed.ManagedCancellation
-import io.github.bbuchsbaum.scalaslurm.managed.ManagedController
-import io.github.bbuchsbaum.scalaslurm.managed.ManagedObservation
-import io.github.bbuchsbaum.scalaslurm.managed.ManagedPhase
-import io.github.bbuchsbaum.scalaslurm.managed.ManagedSubmitResult
-import io.github.bbuchsbaum.scalaslurm.managed.ResultAttachment
-import io.github.bbuchsbaum.scalaslurm.managed.VerifiedAttachment
-import io.github.bbuchsbaum.scalaslurm.managed.VerifiedResultPayload
-import io.github.bbuchsbaum.scalaslurm.ssh.Slurm as SlurmSsh
-import io.github.bbuchsbaum.scalaslurm.ssh.SlurmSshConfig
-import io.github.bbuchsbaum.scalaslurm.worker.PreparedRegisteredSubmission
-import io.github.bbuchsbaum.scalaslurm.worker.FileTaskContext
-import io.github.bbuchsbaum.scalaslurm.worker.RegisteredTaskLauncher
-import io.github.bbuchsbaum.scalaslurm.worker.WorkerLaunchSettings
+import io.github.bbuchsbaum.slurm4s.core.*
+import io.github.bbuchsbaum.slurm4s.local.SlurmLocal
+import io.github.bbuchsbaum.slurm4s.local.SlurmLocalConfig
+import io.github.bbuchsbaum.slurm4s.managed.ControlFailure
+import io.github.bbuchsbaum.slurm4s.managed.Managed
+import io.github.bbuchsbaum.slurm4s.managed.ManagedAttempt
+import io.github.bbuchsbaum.slurm4s.managed.ManagedCancellation
+import io.github.bbuchsbaum.slurm4s.managed.ManagedController
+import io.github.bbuchsbaum.slurm4s.managed.ManagedObservation
+import io.github.bbuchsbaum.slurm4s.managed.ManagedPhase
+import io.github.bbuchsbaum.slurm4s.managed.ManagedSubmitResult
+import io.github.bbuchsbaum.slurm4s.managed.ResultAttachment
+import io.github.bbuchsbaum.slurm4s.managed.VerifiedAttachment
+import io.github.bbuchsbaum.slurm4s.managed.VerifiedResultPayload
+import io.github.bbuchsbaum.slurm4s.ssh.Slurm as SlurmSsh
+import io.github.bbuchsbaum.slurm4s.ssh.SlurmSshConfig
+import io.github.bbuchsbaum.slurm4s.worker.PreparedRegisteredSubmission
+import io.github.bbuchsbaum.slurm4s.worker.FileTaskContext
+import io.github.bbuchsbaum.slurm4s.worker.RegisteredTaskLauncher
+import io.github.bbuchsbaum.slurm4s.worker.WorkerLaunchSettings
 import io.github.bbuchsbaum.sojourn.*
 import io.github.bbuchsbaum.sojourn.runtime.ArtifactPublisher
+import io.github.bbuchsbaum.sojourn.runtime.ByteVectors
 import io.github.bbuchsbaum.sojourn.runtime.FsSiteStore
 import io.github.bbuchsbaum.sojourn.runtime.KeyToken
 import io.github.bbuchsbaum.sojourn.runtime.OperationRegistry
@@ -40,6 +42,7 @@ import io.github.bbuchsbaum.sojourn.runtime.SitePreflight
 import java.nio.file.Files as JFiles
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.time.Instant
 import scala.concurrent.duration.*
 
 /** Configuration for a Slurm-backed site driven through the local CLI on a host that shares a POSIX
@@ -65,7 +68,9 @@ final case class SlurmSiteConfig(
     maximumResultBytes: ByteLimit = ByteLimit.maximumCommandCapture,
     maximumEnvelopeBytes: ByteLimit = ByteLimit.maximumCommandCapture,
     pollEvery: FiniteDuration = 1.second,
-    settleGrace: FiniteDuration = 15.seconds
+    settleGrace: FiniteDuration = 15.seconds,
+    /** Bounds continuous `Unobservable` polling. Default matches [[settleGrace]]. */
+    observationPolicy: ObservationPolicy = ObservationPolicy.SettleUnknownAfter(15.seconds)
 )
 
 /** Raised only at acquisition: the workspace failed its filesystem preflight or the Slurm CLI
@@ -73,9 +78,9 @@ final case class SlurmSiteConfig(
   */
 final class SlurmSiteUnavailable(val detail: String) extends RuntimeException(detail)
 
-/** Package-visible adapter between scheduler-neutral Sojourn artifacts and scala-slurm output
-  * staging. Kept separate from lifecycle control so contract lowering and promotion can be tested
-  * without constructing a scheduler.
+/** Package-visible adapter between scheduler-neutral Sojourn artifacts and slurm4s output staging.
+  * Kept separate from lifecycle control so contract lowering and promotion can be tested without
+  * constructing a scheduler.
   */
 private[slurm] object SlurmArtifactBridge:
   def resultContract[I, O](
@@ -208,12 +213,11 @@ object SlurmSite:
         val operations: OperationCatalog = catalog
         val batch: TaskRunner[IO] = executor
         def store: SiteStore[IO] = siteStore
-        def pool(spec: PoolSpec): Resource[IO, LeasedPool[IO]] =
-          Resource.eval(
-            IO.raiseError(
-              new UnsupportedOperationException("the Slurm pool arrives with the spool runtime")
-            )
-          )
+        def attach[O](
+            descriptor: TaskDescriptor,
+            result: io.github.bbuchsbaum.remoteexec.kernel.ResultCodec[O]
+        ): IO[Either[AttachFailure, TaskHandle[IO, O]]] =
+          IO.pure(Left(AttachFailure.NotSupported))
     )
 
   def local(
@@ -332,7 +336,13 @@ object SlurmSite:
     * Sojourn result attachment.
     */
   final private case class SlurmTask(
-      outcome: Deferred[IO, TaskOutcome[Nothing]]
+      fingerprint: RequestFingerprint,
+      outcome: Deferred[IO, TaskResult[Nothing]],
+      lastPhase: Ref[IO, TaskPhase],
+      attemptId: AttemptId,
+      epoch: AttemptEpoch,
+      startedAt: Instant,
+      allocation: Option[String]
   )
 
   final private class ControllerManagedBatchExecutor(
@@ -360,16 +370,17 @@ object SlurmSite:
         input: TaskInput[I],
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-      for
-        isClosed <- closed.get
-        outcome <-
-          if isClosed then IO.pure(Left(SubmitRejection.Closed))
-          else
-            resolveInput(op, input).flatMap {
-              case Left(rejection)   => IO.pure(Left(rejection))
-              case Right((value, _)) => prepareAndAdmit(op, value, key)
-            }
-      yield outcome
+      // Closed check + process-local attachment registration are the uncancelable boundary;
+      // prepare/submit/inspect are cancelable external work (see attachToAttempt).
+      closed.get.flatMap { isClosed =>
+        if isClosed then IO.pure(Left(SubmitRejection.Closed))
+        else
+          resolveInput(op, input).flatMap {
+            case Left(rejection)          => IO.pure(Left(rejection))
+            case Right((value, identity)) =>
+              prepareAndAdmit(op, value, RequestFingerprint.compute(op, identity), key)
+          }
+      }
 
     /** Prepare and durably record before returning a handle.
       *
@@ -379,18 +390,24 @@ object SlurmSite:
     private def prepareAndAdmit[I, O](
         op: SiteOperation[I, O],
         value: I,
+        proposed: RequestFingerprint,
         key: SubmissionKey
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
       SlurmArtifactBridge.resultContract(op, config.maximumResultBytes) match
         case Left(failure) =>
           completedHandle[O](
             key,
+            proposed,
             preparationFailed(Vector("artifact-contract", failure.reason))
           )
         case Right(contract) =>
           JobName.from(s"sojourn-${KeyToken.forKey(key).value.take(12)}") match
             case Left(failure) =>
-              completedHandle[O](key, preparationFailed(Vector("job-name", failure.reason)))
+              completedHandle[O](
+                key,
+                proposed,
+                preparationFailed(Vector("job-name", failure.reason))
+              )
             case Right(jobName) =>
               val request = JobRequest(
                 key,
@@ -404,6 +421,7 @@ object SlurmSite:
                 case Left(diagnostics) =>
                   completedHandle[O](
                     key,
+                    proposed,
                     preparationFailed(
                       diagnostics.values.toVector.flatMap(d => Vector(d.code, d.message))
                     )
@@ -411,88 +429,191 @@ object SlurmSite:
                 case Right(prepared) =>
                   erase(prepared.schedulerRequest) match
                     case Left(reason) =>
-                      completedHandle[O](key, preparationFailed(Vector("erase-request", reason)))
+                      completedHandle[O](
+                        key,
+                        proposed,
+                        preparationFailed(Vector("erase-request", reason))
+                      )
                     case Right(erased) =>
-                      controller.submit(erased).flatMap {
-                        case ManagedSubmitResult.Conflict(_) =>
-                          IO.pure(Left(SubmitRejection.Conflict(key)))
-                        case ManagedSubmitResult.Failed(failure) =>
-                          IO.pure(
-                            Left(
-                              SubmitRejection.InvalidInput(
-                                ValidationFailure("managedSubmit", failure.toString)
-                              )
+                      LaunchSpec.fromRequest(erased) match
+                        case Left(diagnostics) =>
+                          completedHandle[O](
+                            key,
+                            proposed,
+                            preparationFailed(
+                              diagnostics.values.toVector.flatMap(d => Vector(d.code, d.message))
                             )
                           )
-                        case ManagedSubmitResult.Created(_) | ManagedSubmitResult.Existing(_) =>
-                          controller.inspect(key).flatMap {
-                            case None =>
-                              completedHandle[O](
-                                key,
-                                TaskOutcome.Unknown(
-                                  Diagnostics.one(
-                                    Diagnostic(
-                                      "durable-attempt-missing",
-                                      "managed submit succeeded but its attempt could not be read"
-                                    )
+                        case Right(spec) =>
+                          controller.submit(spec).flatMap {
+                            case ManagedSubmitResult.Conflict(failure) =>
+                              conflictRejection(key, proposed, failure)
+                            case ManagedSubmitResult.Failed(failure) =>
+                              IO.pure(
+                                Left(
+                                  SubmitRejection.InvalidInput(
+                                    ValidationFailure("managedSubmit", failure.toString)
                                   )
                                 )
                               )
-                            case Some(attempt) =>
-                              attachToAttempt(key, prepared, contract, op.artifacts, attempt)
+                            case ManagedSubmitResult.Created(_) | ManagedSubmitResult.Existing(_) =>
+                              controller.inspect(key).flatMap {
+                                case None =>
+                                  completedHandle[O](
+                                    key,
+                                    proposed,
+                                    TaskOutcome.Unknown(
+                                      Diagnostics.one(
+                                        Diagnostic(
+                                          "durable-attempt-missing",
+                                          "managed submit succeeded but its attempt could not be read"
+                                        )
+                                      )
+                                    )
+                                  )
+                                case Some(attempt) =>
+                                  attachToAttempt(
+                                    key,
+                                    proposed,
+                                    prepared,
+                                    contract,
+                                    op.artifacts,
+                                    attempt
+                                  )
+                              }
                           }
-                      }
               }
+
+    /** Map a managed journal digest conflict onto Sojourn [[RequestFingerprint]] Conflict. */
+    private def conflictRejection(
+        key: SubmissionKey,
+        proposed: RequestFingerprint,
+        failure: ControlFailure.DigestConflict
+    ): IO[Either[SubmitRejection, Nothing]] =
+      tasks.get.map(_.get(key)).flatMap {
+        case Some(existing) =>
+          IO.pure(Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed)))
+        case None =>
+          // Cross-process conflict: Sojourn fingerprint was not yet echoed into the journal.
+          // Report the managed-request digests as opaque ContentDigests wrapped as fingerprints
+          // so Conflict always carries two digests; local/pool paths use true RequestFingerprint.
+          IO.pure(
+            Left(
+              SubmitRejection.Conflict(
+                key,
+                RequestFingerprint.fromDigest(failure.existing),
+                proposed
+              )
+            )
+          )
+      }
 
     private def completedHandle[O](
         key: SubmissionKey,
+        fingerprint: RequestFingerprint,
         outcome: TaskOutcome[Nothing]
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
-      Deferred[IO, TaskOutcome[Nothing]].flatMap { settled =>
-        val task = SlurmTask(settled)
-        settle(task, outcome).as(Right(taskHandle[O](key, task)))
+      for
+        settled <- Deferred[IO, TaskResult[Nothing]]
+        phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
+        startedAt <- Clock[IO].realTimeInstant
+        attemptId <- mintLocalAttemptId(key)
+        handle <- attemptId match
+          case Left(rejection) => IO.pure(Left(rejection))
+          case Right(minted)   =>
+            val task = SlurmTask(
+              fingerprint,
+              settled,
+              phase,
+              minted,
+              AttemptEpoch.initial,
+              startedAt,
+              None
+            )
+            settle(task, outcome).as(Right(taskHandle[O](key, task)))
+      yield handle
+
+    private def mintLocalAttemptId(key: SubmissionKey): IO[Either[SubmitRejection, AttemptId]] =
+      IO(java.util.UUID.randomUUID().toString.toLowerCase).map { uuid =>
+        AttemptId
+          .from(s"${key.value}-a$uuid")
+          .left
+          .map(failure => SubmitRejection.InvalidInput(failure))
       }
 
     private def attachToAttempt[O](
         key: SubmissionKey,
+        fingerprint: RequestFingerprint,
         prepared: PreparedRegisteredSubmission[O],
         contract: ResultContract.Structured[O],
         declarations: ArtifactDeclarations,
         attempt: ManagedAttempt
     ): IO[Either[SubmitRejection, TaskHandle[IO, O]]] =
       for
-        settled <- Deferred[IO, TaskOutcome[Nothing]]
-        candidate = SlurmTask(settled)
-        task <- tasks.modify { current =>
-          current.get(key) match
-            case Some(existing) => current -> existing
-            case None           => current.updated(key, candidate) -> candidate
+        settled <- Deferred[IO, TaskResult[Nothing]]
+        phase <- Ref.of[IO, TaskPhase](TaskPhase.Queued)
+        startedAt <- Clock[IO].realTimeInstant
+        allocation = attempt.currentJob.map { job =>
+          job.arrayIndex match
+            case Some(index) => s"${job.jobId.value}_${index.value}"
+            case None        => job.jobId.value
+        }
+        candidate = SlurmTask(
+          fingerprint,
+          settled,
+          phase,
+          attempt.intent.attemptId,
+          attempt.intent.epoch,
+          startedAt,
+          allocation
+        )
+        // Process-local attachment insert is the registration boundary.
+        task <- IO.uncancelable { _ =>
+          closed.get.flatMap {
+            case true  => IO.pure(candidate) // drive path will see closed via supervise failure
+            case false =>
+              tasks.modify { current =>
+                current.get(key) match
+                  case Some(existing) if existing.fingerprint == fingerprint =>
+                    current -> existing
+                  case Some(existing) =>
+                    current -> existing // conflict owned by managed submit; keep first attachment
+                  case None => current.updated(key, candidate) -> candidate
+              }
+          }
         }
         result <-
-          if task ne candidate then IO.pure(Right(taskHandle[O](key, task)))
+          if task.fingerprint != fingerprint then
+            IO.pure(Left(SubmitRejection.Conflict(key, task.fingerprint, fingerprint)))
+          else if task ne candidate then IO.pure(Right(taskHandle[O](key, task)))
           else
-            supervisor
-              .supervise(
-                drive(key, prepared, contract, declarations, task, attempt).onCancel(
-                  settle(
-                    task,
-                    TaskOutcome.Unknown(
-                      Diagnostics.one(
-                        Diagnostic(
-                          "site-closed",
-                          "the site was released before this task settled"
+            closed.get.flatMap {
+              case true =>
+                tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+              case false =>
+                supervisor
+                  .supervise(
+                    drive(key, prepared, contract, declarations, task, attempt).onCancel(
+                      settle(
+                        task,
+                        TaskOutcome.Unknown(
+                          Diagnostics.one(
+                            Diagnostic(
+                              "site-closed",
+                              "the site was released before this task settled"
+                            )
+                          )
                         )
                       )
                     )
                   )
-                )
-              )
-              .attempt
-              .flatMap {
-                case Right(_) => IO.pure(Right(taskHandle[O](key, task)))
-                case Left(_)  =>
-                  tasks.update(_ - key).as(Left(SubmitRejection.Closed))
-              }
+                  .attempt
+                  .flatMap {
+                    case Right(_) => IO.pure(Right(taskHandle[O](key, task)))
+                    case Left(_)  =>
+                      tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                  }
+            }
       yield result
 
     /** Resolve the task input to its typed value plus its identity digest. */
@@ -514,7 +635,7 @@ object SlurmSite:
                 Right(
                   (
                     value,
-                    io.github.bbuchsbaum.scalaslurm.worker.AtomicFiles.digestOf(bytes)
+                    io.github.bbuchsbaum.remoteexec.kernel.AtomicFiles.digestOf(bytes)
                   )
                 )
           )
@@ -527,7 +648,7 @@ object SlurmSite:
                 )
               )
             case Right(bytes) =>
-              op.input.decode(bytes) match
+              op.input.decode(ByteVectors.of(bytes)) match
                 case Left(failure) =>
                   Left(
                     SubmitRejection.InvalidInput(
@@ -565,7 +686,76 @@ object SlurmSite:
 
     /** Idempotently settle a task (first writer wins). */
     private def settle(task: SlurmTask, result: TaskOutcome[Nothing]): IO[Unit] =
-      task.outcome.complete(result).void
+      Clock[IO].realTimeInstant.flatMap { finishedAt =>
+        val attempt = AttemptRecord(
+          attemptId = task.attemptId,
+          epoch = task.epoch,
+          startedAt = Some(task.startedAt),
+          finishedAt = Some(finishedAt),
+          worker = None,
+          allocation = task.allocation,
+          interruption = TaskReport.interruptionOf(result),
+          indeterminacy = TaskReport.indeterminacyOf(result)
+        )
+        task.lastPhase.update(TaskPhase.advance(_, TaskPhase.Settled)) *>
+          task.outcome
+            .complete(
+              TaskResult(
+                result,
+                TaskReport.fromOutcome(
+                  result,
+                  requestFingerprint = Some(task.fingerprint),
+                  attempts = Vector(attempt)
+                )
+              )
+            )
+            .void
+      }
+
+    private def taskHandle[O](submissionKey: SubmissionKey, task: SlurmTask): TaskHandle[IO, O] =
+      new TaskHandle[IO, O]:
+        def key: SubmissionKey = submissionKey
+
+        def status: IO[TaskStatus] =
+          for
+            now <- Clock[IO].realTimeInstant
+            settled <- task.outcome.tryGet
+            durable <- controller.inspect(submissionKey)
+            observed =
+              settled match
+                case Some(_) => TaskPhase.Settled
+                case None    =>
+                  durable match
+                    case Some(attempt) => managedPhase(attempt)
+                    case None          => TaskPhase.Queued
+            phase <- task.lastPhase.updateAndGet(TaskPhase.advance(_, observed))
+            freshness = settled match
+              case Some(_) =>
+                durable.fold[Freshness](Freshness.Current(now))(managedFreshness)
+              case None =>
+                durable match
+                  case Some(attempt) => managedFreshness(attempt)
+                  case None          =>
+                    Freshness.Unknown(
+                      now,
+                      Diagnostics.one(
+                        Diagnostic(
+                          "durable-attempt-missing",
+                          s"no managed attempt exists for ${submissionKey.value}"
+                        )
+                      )
+                    )
+          yield TaskStatus(phase, freshness)
+
+        def await: IO[TaskOutcome[O]] =
+          task.outcome.get.map(result => result.outcome: TaskOutcome[O])
+
+        def awaitResult: IO[TaskResult[O]] =
+          task.outcome.get.map(result => TaskResult(result.outcome: TaskOutcome[O], result.report))
+
+        def cancel: IO[Unit] =
+          controller.requestCancellation(submissionKey).attempt *>
+            controller.dispatchCancellation(submissionKey).attempt.void
 
     private def resume[O](
         key: SubmissionKey,
@@ -698,23 +888,53 @@ object SlurmSite:
                       .map(attempt => vanishedWithoutResult(detail, attempt.map(_.cancellation)))
                   else IO.sleep(config.pollEvery) *> loop(Some((since, PendingEnd.Vanished)))
                 case Observed.Unobservable(detail) =>
-                  // Keep polling: the envelope may still arrive; the observation gap is evidence,
-                  // not an outcome — and the status surface says so via Freshness.Unknown.
-                  // (A walltime-scale bound arrives with lease integration.)
-                  IO.sleep(config.pollEvery) *> loop(pendingSince)
+                  // Observation gap is evidence, not an outcome. Bound continuous unobservability
+                  // per [[ObservationPolicy]] so handles cannot hang forever.
+                  unobservableBound match
+                    case None =>
+                      IO.sleep(config.pollEvery) *> loop(pendingSince)
+                    case Some(bound) =>
+                      val since = pendingSince match
+                        case Some((instant, PendingEnd.Unobservable)) => instant
+                        case _                                        => now
+                      if java.time.Duration.between(since, now).toMillis >= bound.toMillis then
+                        IO.pure(
+                          TaskOutcome.Unknown(
+                            Diagnostics.one(
+                              Diagnostic(
+                                "observation-unbounded",
+                                s"scheduler remained unobservable for ${bound.toMillis}ms: $detail"
+                              )
+                            )
+                          )
+                        )
+                      else
+                        IO.sleep(config.pollEvery) *>
+                          loop(Some((since, PendingEnd.Unobservable)))
               }
         yield outcome
       loop(None)
 
+    private def unobservableBound: Option[FiniteDuration] =
+      config.observationPolicy match
+        case ObservationPolicy.UntilKnown                => None
+        case ObservationPolicy.SettleUnknownAfter(bound) => Some(bound)
+        case ObservationPolicy.UntilLeaseBound           =>
+          // Batch Slurm has no lease yet; the settle grace is the honest stand-in bound.
+          Some(config.settleGrace)
+
     private def graceElapsed(since: java.time.Instant, now: java.time.Instant): Boolean =
       java.time.Duration.between(since, now).toMillis >= config.settleGrace.toMillis
 
-    /** What a grace window is waiting out: a listed terminal state, or a vanished listing. */
-    private enum PendingEnd:
+    /** What a grace window is waiting out: a listed terminal state, a vanished listing, or a
+      * continuous unobservable gap under [[ObservationPolicy.SettleUnknownAfter]].
+      */
+    private enum PendingEnd derives CanEqual:
       case Terminal(state: SlurmState)
       case Vanished
+      case Unobservable
 
-    private enum Observed:
+    private enum Observed derives CanEqual:
       case Waiting
       case Running
       case Terminal(state: SlurmState)
@@ -730,7 +950,7 @@ object SlurmSite:
           attempt.observation match
             case ManagedObservation.Current(result) =>
               result match
-                case ObservationResult.Observed(observation) => classify(observation.state)
+                case ObservationResult.Observed(observation) => classify(observation)
                 case ObservationResult.NotFound(_, _, _)     =>
                   Observed.Vanished("job not listed by the scheduler")
                 case ObservationResult.Failed(_, _, diagnostics, _) =>
@@ -749,21 +969,26 @@ object SlurmSite:
               Observed.Unobservable("managed attempt has no scheduler observation")
       }
 
-    /** Exhaustive over SlurmState — the compiler polices every new upstream case. Requeue states
+    /** Exhaustive over SlurmState — the compiler polices every new upstream case. Requeue *flags*
       * keep waiting (the job will run again under the same identity — discussed, not silent); an
       * unrecognized listed state is an observation we cannot classify, never 'still waiting'.
       */
-    private def classify(state: SlurmState): Observed = state match
-      case SlurmState.Running | SlurmState.Completing => Observed.Running
-      case SlurmState.Pending                         => Observed.Waiting
-      case SlurmState.Requeued | SlurmState.RequeueHeld | SlurmState.RequeueFederation =>
-        Observed.Waiting
-      case SlurmState.Completed | SlurmState.Failed | SlurmState.Cancelled |
-          SlurmState.OutOfMemory | SlurmState.TimedOut | SlurmState.NodeFailure |
-          SlurmState.Preempted | SlurmState.SpecialExit =>
-        Observed.Terminal(state)
-      case SlurmState.Unknown(raw) =>
-        Observed.Unobservable(s"unrecognized scheduler state '$raw'")
+    private def classify(observation: JobObservation): Observed =
+      val report = ReportedState(observation.state, observation.flags, truncated = false)
+      if report.flags.contains(SlurmStateFlag.Completing) then Observed.Running
+      else if io.github.bbuchsbaum.slurm4s.core.InterruptionClass.classify(report) ==
+          io.github.bbuchsbaum.slurm4s.core.InterruptionClass.Requeueing
+      then Observed.Waiting
+      else
+        observation.state match
+          case SlurmState.Running                        => Observed.Running
+          case SlurmState.Pending | SlurmState.Suspended => Observed.Waiting
+          case SlurmState.Completed | SlurmState.Failed | SlurmState.Cancelled |
+              SlurmState.OutOfMemory | SlurmState.TimedOut | SlurmState.NodeFailure |
+              SlurmState.Preempted | SlurmState.BootFail | SlurmState.Deadline =>
+            Observed.Terminal(observation.state)
+          case SlurmState.Unknown(raw) =>
+            Observed.Unobservable(s"unrecognized scheduler state '$raw'")
 
     private def attach[O](
         prepared: PreparedRegisteredSubmission[O],
@@ -840,7 +1065,7 @@ object SlurmSite:
             ): TaskOutcome[Nothing]
           )
         case Right(schema) =>
-          fsStore.putBytes(payload.encodedValue, schema).flatMap {
+          fsStore.putBytes(ByteVectors.toVector(payload.encodedValue), schema).flatMap {
             case Right(ref) =>
               val result =
                 RemoteRef[Nothing](ref.site, ref.path, ref.digest, ref.schema)
@@ -869,16 +1094,17 @@ object SlurmSite:
               )
           }
 
-    /** A listed terminal state with no envelope after the grace. Exhaustive over InterruptionClass;
-      * classification uncertainty settles as Unknown, never a fabricated interruption.
-      * Cancel-request evidence (and any delivery failures) rides the diagnostics.
+    /** A listed terminal state with no envelope after the grace. Exhaustive over slurm4s
+      * InterruptionClass; classification uncertainty settles as Unknown, never a fabricated
+      * interruption. Cancel-request evidence (and any delivery failures) rides the diagnostics.
       */
     private def terminalWithoutResult(
         state: SlurmState,
         cancel: Option[ManagedCancellation]
     ): TaskOutcome[Nothing] =
-      InterruptionClass.classify(state) match
-        case InterruptionClass.NotInterrupted | InterruptionClass.WorkloadFailure =>
+      import io.github.bbuchsbaum.slurm4s.core.InterruptionClass as SlurmInterruption
+      SlurmInterruption.classify(state) match
+        case SlurmInterruption.NotInterrupted | SlurmInterruption.WorkloadFailure =>
           TaskOutcome.Failed(
             FailureDiagnosis(
               FailureCause.ProgramFailed(
@@ -889,10 +1115,10 @@ object SlurmSite:
               Vector.empty
             )
           )
-        case InterruptionClass.Requeueing | InterruptionClass.InfrastructureFailure |
-            InterruptionClass.SchedulerPolicy | InterruptionClass.Cancellation =>
+        case SlurmInterruption.Requeueing | SlurmInterruption.InfrastructureFailure |
+            SlurmInterruption.SchedulerPolicy | SlurmInterruption.Cancellation =>
           TaskOutcome.Interrupted(interruptDiagnostics(state.toString, cancel))
-        case InterruptionClass.Unknown =>
+        case SlurmInterruption.Unknown =>
           TaskOutcome.Unknown(
             Diagnostics.one(
               Diagnostic(
@@ -951,8 +1177,11 @@ object SlurmSite:
 
     private def workloadFailed(outcome: WorkloadOutcome): TaskOutcome[Nothing] =
       val cause = outcome match
-        case WorkloadOutcome.Completed(exitCode) =>
-          FailureCause.ProgramFailed(Some(exitCode), Vector("completed-reported-as-failure"))
+        case WorkloadOutcome.Completed(exitStatus) =>
+          val code = exitStatus match
+            case CompletionExitStatus.ReportedZero => Some(0)
+            case CompletionExitStatus.Undisclosed  => None
+          FailureCause.ProgramFailed(code, Vector("completed-reported-as-failure"))
         case WorkloadOutcome.Failed(exitCode, diagnostics) =>
           FailureCause.ProgramFailed(
             exitCode,
@@ -995,46 +1224,6 @@ object SlurmSite:
           )
         case _ => Left("prepared request was not a script")
 
-    private def taskHandle[O](submissionKey: SubmissionKey, task: SlurmTask): TaskHandle[IO, O] =
-      new TaskHandle[IO, O]:
-        def key: SubmissionKey = submissionKey
-
-        def status: IO[TaskStatus] =
-          for
-            now <- Clock[IO].realTimeInstant
-            settled <- task.outcome.tryGet
-            durable <- controller.inspect(submissionKey)
-          yield settled match
-            case Some(_) =>
-              TaskStatus(
-                TaskPhase.Settled,
-                durable.fold[Freshness](Freshness.Current(now))(managedFreshness)
-              )
-            case None =>
-              durable match
-                case Some(attempt) =>
-                  TaskStatus(managedPhase(attempt), managedFreshness(attempt))
-                case None =>
-                  TaskStatus(
-                    TaskPhase.Queued,
-                    Freshness.Unknown(
-                      now,
-                      Diagnostics.one(
-                        Diagnostic(
-                          "durable-attempt-missing",
-                          s"no managed attempt exists for ${submissionKey.value}"
-                        )
-                      )
-                    )
-                  )
-
-        def await: IO[TaskOutcome[O]] =
-          task.outcome.get.map(outcome => outcome: TaskOutcome[O])
-
-        def cancel: IO[Unit] =
-          controller.requestCancellation(submissionKey).attempt *>
-            controller.dispatchCancellation(submissionKey).attempt.void
-
     private def managedPhase(attempt: ManagedAttempt): TaskPhase =
       attempt.phase match
         case ManagedPhase.IntentRecorded | _: ManagedPhase.Submitting => TaskPhase.Queued
@@ -1043,7 +1232,7 @@ object SlurmSite:
           attempt.observation match
             case ManagedObservation.Current(ObservationResult.Observed(observation))
                 if observation.state == SlurmState.Running ||
-                  observation.state == SlurmState.Completing =>
+                  observation.flags.contains(SlurmStateFlag.Completing) =>
               TaskPhase.Running
             case _ => TaskPhase.Dispatched
         case _: ManagedPhase.SubmissionRejected | _: ManagedPhase.SubmissionUnavailable |
