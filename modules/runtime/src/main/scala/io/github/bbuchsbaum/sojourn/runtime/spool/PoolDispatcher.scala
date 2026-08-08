@@ -232,24 +232,16 @@ object PoolDispatcher:
         state.snapshot.discrete.takeThrough(snapshot => !snapshot.isRevoked)
 
       def events: Stream[IO, LeaseEvent] =
-        // Late subscribers: if already revoked, emit the terminal once and complete. If already
-        // granted, replay Granted from the atomic snapshot, then follow live updates until revoke.
-        // Never `drop(1)` past a terminal snapshot — that would leave the stream waiting forever.
-        Stream.eval(state.snapshot.get).flatMap { snap =>
-          snap.terminal match
-            case Some(revoked) => Stream.emit(revoked: LeaseEvent)
-            case None          =>
-              val replay =
-                if snap.granted then Stream.emit(LeaseEvent.Granted(snap.ready))
-                else Stream.empty
-              val live = state.snapshot.discrete
-                .drop(1)
-                .takeThrough(snapshot => !snapshot.isRevoked)
-                .map(_.lastTransition)
-                .unNone
-              (replay ++ live)
-                .filterWithPrevious((previous, next) => !(isGranted(previous) && isGranted(next)))
-        }
+        // Subscribe to the signalling ref directly — never `get` then `discrete.drop(1)`.
+        // That TOCTOU drops a terminal snapshot published between the read and the subscribe,
+        // leaving the stream waiting forever (release-before-expiry collector hang under load).
+        // `discrete` emits the current value first, so late subscribers still see an existing
+        // Revoked / Granted transition via lastTransition; `unNone` skips the virgin snapshot.
+        state.snapshot.discrete
+          .takeThrough(snapshot => !snapshot.isRevoked)
+          .map(_.lastTransition)
+          .unNone
+          .filterWithPrevious((previous, next) => !(isGranted(previous) && isGranted(next)))
 
     private def isGranted(event: LeaseEvent): Boolean = event match
       case LeaseEvent.Granted(_)                                                   => true
