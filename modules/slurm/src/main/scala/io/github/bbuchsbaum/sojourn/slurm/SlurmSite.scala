@@ -78,9 +78,9 @@ final case class SlurmSiteConfig(
   */
 final class SlurmSiteUnavailable(val detail: String) extends RuntimeException(detail)
 
-/** Package-visible adapter between scheduler-neutral Sojourn artifacts and slurm4s output
-  * staging. Kept separate from lifecycle control so contract lowering and promotion can be tested
-  * without constructing a scheduler.
+/** Package-visible adapter between scheduler-neutral Sojourn artifacts and slurm4s output staging.
+  * Kept separate from lifecycle control so contract lowering and promotion can be tested without
+  * constructing a scheduler.
   */
 private[slurm] object SlurmArtifactBridge:
   def resultContract[I, O](
@@ -570,7 +570,7 @@ object SlurmSite:
         // Process-local attachment insert is the registration boundary.
         task <- IO.uncancelable { _ =>
           closed.get.flatMap {
-            case true => IO.pure(candidate) // drive path will see closed via supervise failure
+            case true  => IO.pure(candidate) // drive path will see closed via supervise failure
             case false =>
               tasks.modify { current =>
                 current.get(key) match
@@ -724,7 +724,7 @@ object SlurmSite:
             observed =
               settled match
                 case Some(_) => TaskPhase.Settled
-                case None =>
+                case None    =>
                   durable match
                     case Some(attempt) => managedPhase(attempt)
                     case None          => TaskPhase.Queued
@@ -735,7 +735,7 @@ object SlurmSite:
               case None =>
                 durable match
                   case Some(attempt) => managedFreshness(attempt)
-                  case None =>
+                  case None          =>
                     Freshness.Unknown(
                       now,
                       Diagnostics.one(
@@ -917,9 +917,9 @@ object SlurmSite:
 
     private def unobservableBound: Option[FiniteDuration] =
       config.observationPolicy match
-        case ObservationPolicy.UntilKnown              => None
+        case ObservationPolicy.UntilKnown                => None
         case ObservationPolicy.SettleUnknownAfter(bound) => Some(bound)
-        case ObservationPolicy.UntilLeaseBound =>
+        case ObservationPolicy.UntilLeaseBound           =>
           // Batch Slurm has no lease yet; the settle grace is the honest stand-in bound.
           Some(config.settleGrace)
 
@@ -977,12 +977,11 @@ object SlurmSite:
       val report = ReportedState(observation.state, observation.flags, truncated = false)
       if report.flags.contains(SlurmStateFlag.Completing) then Observed.Running
       else if io.github.bbuchsbaum.slurm4s.core.InterruptionClass.classify(report) ==
-        io.github.bbuchsbaum.slurm4s.core.InterruptionClass.Requeueing
-      then
-        Observed.Waiting
+          io.github.bbuchsbaum.slurm4s.core.InterruptionClass.Requeueing
+      then Observed.Waiting
       else
         observation.state match
-          case SlurmState.Running => Observed.Running
+          case SlurmState.Running                        => Observed.Running
           case SlurmState.Pending | SlurmState.Suspended => Observed.Waiting
           case SlurmState.Completed | SlurmState.Failed | SlurmState.Cancelled |
               SlurmState.OutOfMemory | SlurmState.TimedOut | SlurmState.NodeFailure |
@@ -1103,7 +1102,7 @@ object SlurmSite:
         state: SlurmState,
         cancel: Option[ManagedCancellation]
     ): TaskOutcome[Nothing] =
-      import io.github.bbuchsbaum.slurm4s.core.{InterruptionClass as SlurmInterruption}
+      import io.github.bbuchsbaum.slurm4s.core.InterruptionClass as SlurmInterruption
       SlurmInterruption.classify(state) match
         case SlurmInterruption.NotInterrupted | SlurmInterruption.WorkloadFailure =>
           TaskOutcome.Failed(
@@ -1116,10 +1115,8 @@ object SlurmSite:
               Vector.empty
             )
           )
-        case
-            SlurmInterruption.Requeueing | SlurmInterruption.InfrastructureFailure |
-            SlurmInterruption.SchedulerPolicy | SlurmInterruption.Cancellation
-          =>
+        case SlurmInterruption.Requeueing | SlurmInterruption.InfrastructureFailure |
+            SlurmInterruption.SchedulerPolicy | SlurmInterruption.Cancellation =>
           TaskOutcome.Interrupted(interruptDiagnostics(state.toString, cancel))
         case SlurmInterruption.Unknown =>
           TaskOutcome.Unknown(

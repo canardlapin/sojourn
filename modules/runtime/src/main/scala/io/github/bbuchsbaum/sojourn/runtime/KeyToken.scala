@@ -9,9 +9,9 @@ import java.security.MessageDigest
   *
   * Submission keys permit `/`, `..`, uppercase, and arbitrary non-whitespace unicode, so they can
   * never be embedded verbatim in a filename. A key token is the lowercase-hex SHA-256 of the key's
-  * UTF-8 bytes, truncated to 32 hex characters (128 bits) — the established slurm4s idiom. A
-  * token is a *locator*, never an identity: every artifact whose name embeds a token must carry the
-  * full key in its body, and readers must verify body-key against expectation before acting.
+  * UTF-8 bytes, truncated to 32 hex characters (128 bits) — the established slurm4s idiom. A token
+  * is a *locator*, never an identity: every artifact whose name embeds a token must carry the full
+  * key in its body, and readers must verify body-key against expectation before acting.
   */
 object KeyToken:
   opaque type Type = String

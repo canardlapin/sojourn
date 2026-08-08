@@ -434,7 +434,8 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           )
           _ <- IO
             .blocking(
-              AtomicFiles.publishOnceBlocking(target, ByteVectors.of(SpoolCodec.encodeResult(forged)))
+              AtomicFiles
+                .publishOnceBlocking(target, ByteVectors.of(SpoolCodec.encodeResult(forged)))
             )
             .flatMap(outcome =>
               IO.fromEither(
@@ -493,14 +494,14 @@ class PoolDispatcherSuite extends CatsEffectSuite:
           undecided <- handle.await.timeout(700.millis).attempt
           _ <- undecided match
             case Left(_: TimeoutException) => IO.unit
-            case other =>
+            case other                     =>
               IO(fail(s"fingerprint-mismatched result must never settle, observed $other"))
         yield handle
       }
       .flatMap { handle =>
         handle.await.timeout(15.seconds).map {
           case TaskOutcome.Interrupted(_) => ()
-          case other =>
+          case other                      =>
             fail(s"expected Interrupted after release, observed $other")
         }
       }

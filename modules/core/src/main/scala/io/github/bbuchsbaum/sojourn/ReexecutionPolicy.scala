@@ -12,8 +12,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.RetrySafety
   *
   *   - [[NeverAutomatically]]: Sojourn never re-dispatches after interrupt / reclaim.
   *   - [[SafeToRepeat]]: Sojourn may re-dispatch (at-least-once under reclaim).
-  *   - [[Unspecified]]: treated like [[NeverAutomatically]] for automatic reclaim; kept distinct
-  *     so catalogs and fingerprints remain honest about what the author declared.
+  *   - [[Unspecified]]: treated like [[NeverAutomatically]] for automatic reclaim; kept distinct so
+  *     catalogs and fingerprints remain honest about what the author declared.
   */
 enum ReexecutionPolicy derives CanEqual:
   case NeverAutomatically
@@ -38,7 +38,7 @@ object ReexecutionPolicy:
     case RetrySafety.Unknown               => Unspecified
 
   def fromWire(text: String): Option[ReexecutionPolicy] = text match
-    case "never-automatically" | "no-automatic-retry"       => Some(NeverAutomatically)
-    case "safe-to-repeat" | "safe-for-automatic-retry"      => Some(SafeToRepeat)
-    case "unspecified" | "unknown"                          => Some(Unspecified)
-    case _                                                  => None
+    case "never-automatically" | "no-automatic-retry"  => Some(NeverAutomatically)
+    case "safe-to-repeat" | "safe-for-automatic-retry" => Some(SafeToRepeat)
+    case "unspecified" | "unknown"                     => Some(Unspecified)
+    case _                                             => None

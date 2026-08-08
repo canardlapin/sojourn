@@ -35,8 +35,8 @@ import scala.util.control.NonFatal
   * digest-verified by construction and identical content deduplicates to one file. Writes go
   * through [[AtomicFiles]] (private temp, fsync, atomic rename); reads are bounded by
   * `maximumObjectBytes` before any decode. All failures are data ([[StoreFailure]]); the only
- * exception ever raised is [[StoreStreamFailure]] inside streaming reads ([[fetchStream]],
- * [[streamVerifiedChunks]]), documented there.
+  * exception ever raised is [[StoreStreamFailure]] inside streaming reads ([[fetchStream]],
+  * [[streamVerifiedChunks]]), documented there.
   *
   * Threat model: the store root is a trusted workspace. On `TargetExists` / `AlreadyClaimed`, the
   * existing entry is re-verified (regular file, NOFOLLOW, size bound, digest) before success —
@@ -183,7 +183,8 @@ final class FsSiteStore[F[_]: Async] private (
     checkSite(ref).flatMap { _ =>
       try
         val target = resolveUnder(ref.path)
-        if !JFiles.exists(target, LinkOption.NOFOLLOW_LINKS) then Left(StoreFailure.NotFound(ref.path))
+        if !JFiles.exists(target, LinkOption.NOFOLLOW_LINKS) then
+          Left(StoreFailure.NotFound(ref.path))
         else if !JFiles.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) then
           Left(StoreFailure.Corrupt(ref.path, "stored object is not a regular file"))
         else if JFiles.size(target) > maximumObjectBytes.value.toLong then
@@ -268,7 +269,12 @@ final class FsSiteStore[F[_]: Async] private (
         val bytes = JFiles.readAllBytes(target).toVector
         val observed = AtomicFiles.digestOf(ByteVectors.of(bytes))
         if observed != expected then
-          Left(StoreFailure.Corrupt(path, s"digest mismatch on CAS verify: expected ${expected.value}, observed ${observed.value}"))
+          Left(
+            StoreFailure.Corrupt(
+              path,
+              s"digest mismatch on CAS verify: expected ${expected.value}, observed ${observed.value}"
+            )
+          )
         else Right(RemoteRef[Vector[Byte]](site, path, expected, schema))
     catch case NonFatal(error) => Left(io(error))
 

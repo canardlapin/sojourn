@@ -2,8 +2,8 @@ package io.github.bbuchsbaum.sojourn.runtime
 
 import scodec.bits.ByteVector
 
-/** Boundary conversions between Sojourn's `Vector[Byte]` wire/storage surface and the
-  * `ByteVector` API used by `remote-exec-kernel` AtomicFiles (and some slurm4s codecs).
+/** Boundary conversions between Sojourn's `Vector[Byte]` wire/storage surface and the `ByteVector`
+  * API used by `remote-exec-kernel` AtomicFiles (and some slurm4s codecs).
   *
   * M4 may collapse the store onto `ByteVector` / chunk streams; until then keep the conversion
   * explicit at the filesystem boundary.

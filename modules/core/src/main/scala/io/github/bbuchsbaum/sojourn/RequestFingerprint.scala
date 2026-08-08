@@ -56,8 +56,8 @@ object SemanticOptions:
   def from(entries: Map[String, String]): SemanticOptions =
     SemanticOptions(entries.toVector.sortBy(_._1).toMap)
 
-/** Canonical SHA-256 identity of one logical request: operation contract + input digest (+
-  * semantic options). Same logical request ⇒ same fingerprint across local, pool, and Slurm.
+/** Canonical SHA-256 identity of one logical request: operation contract + input digest (+ semantic
+  * options). Same logical request ⇒ same fingerprint across local, pool, and Slurm.
   */
 final case class RequestFingerprint private (digest: ContentDigest) derives CanEqual:
   def value: String = digest.value
@@ -93,7 +93,9 @@ object RequestFingerprint:
   def fromDigest(digest: ContentDigest): RequestFingerprint =
     RequestFingerprint(digest)
 
-  def parse(raw: String): Either[io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure, RequestFingerprint] =
+  def parse(
+      raw: String
+  ): Either[io.github.bbuchsbaum.remoteexec.kernel.ValidationFailure, RequestFingerprint] =
     ContentDigest.from(raw).map(fromDigest)
 
   /** Canonical UTF-8 bytes of the versioned fingerprint document (golden-test surface). */
@@ -147,8 +149,8 @@ object RequestFingerprint:
 type ExecutionToken = RequestFingerprint
 val ExecutionToken = RequestFingerprint
 
-/** Digest of a sorted operation catalog — binds worker registration / pool manifests to the
-  * Program they claim to execute.
+/** Digest of a sorted operation catalog — binds worker registration / pool manifests to the Program
+  * they claim to execute.
   */
 final case class CatalogFingerprint private (digest: ContentDigest) derives CanEqual:
   def value: String = digest.value

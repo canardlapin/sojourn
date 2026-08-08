@@ -13,8 +13,8 @@ import io.github.bbuchsbaum.remoteexec.kernel.WorkerReleaseId
 import java.time.Instant
 import scala.concurrent.duration.FiniteDuration
 
-/** Site identity in the public capability API. Today this is [[SiteName]]; kept as an alias so
-  * call sites can migrate to `site.id` without a second opaque type.
+/** Site identity in the public capability API. Today this is [[SiteName]]; kept as an alias so call
+  * sites can migrate to `site.id` without a second opaque type.
   */
 type SiteId = SiteName
 val SiteId = SiteName
@@ -141,7 +141,9 @@ trait Site[F[_]]:
   def store: ObjectStore[F]
   def batch: BatchExecutor[F]
 
-  /** Restore a handle from a durable descriptor. M2 stubs may return [[AttachFailure.NotSupported]]. */
+  /** Restore a handle from a durable descriptor. M2 stubs may return
+    * [[AttachFailure.NotSupported]].
+    */
   def attach[O](
       descriptor: TaskDescriptor,
       result: ResultCodec[O]

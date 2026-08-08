@@ -46,9 +46,12 @@ class HeartbeatStalenessSuite extends CatsEffectSuite:
         advanced = HeartbeatStaleness.observe(Some(arrival), 6L, later)
       yield
         assertEquals(unchanged, HeartbeatStaleness.ObserveResult.Unchanged(arrival))
-        assertEquals(advanced, HeartbeatStaleness.ObserveResult.Advanced(
-          HeartbeatStaleness.Arrival(6L, later)
-        ))
+        assertEquals(
+          advanced,
+          HeartbeatStaleness.ObserveResult.Advanced(
+            HeartbeatStaleness.Arrival(6L, later)
+          )
+        )
         assert(HeartbeatStaleness.stale(unchanged.arrival, later, heartbeatEvery, pollEvery))
         assert(!HeartbeatStaleness.stale(advanced.arrival, later, heartbeatEvery, pollEvery))
     }

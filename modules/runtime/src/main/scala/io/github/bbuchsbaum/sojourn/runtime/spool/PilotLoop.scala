@@ -77,12 +77,12 @@ enum PilotFatal derives CanEqual:
 
   /** Canonical rendering for backend diagnostics and the binary edge. */
   def describe: String = this match
-    case SpoolInvalid(detail)         => s"spool invalid: $detail"
-    case ManifestUnavailable(failure) => s"manifest unavailable: ${failure.describe}"
-    case AlreadyRegistered(pilot)     => s"pilot id ${pilot.value} already registered"
-    case RegistrationFailed(detail)   => s"registration failed: $detail"
-    case AtomicMoveUnavailable(path)  => s"atomic move unavailable: $path"
-    case ResultUnpublishable(detail)  => s"result unpublishable: $detail"
+    case SpoolInvalid(detail)           => s"spool invalid: $detail"
+    case ManifestUnavailable(failure)   => s"manifest unavailable: ${failure.describe}"
+    case AlreadyRegistered(pilot)       => s"pilot id ${pilot.value} already registered"
+    case RegistrationFailed(detail)     => s"registration failed: $detail"
+    case AtomicMoveUnavailable(path)    => s"atomic move unavailable: $path"
+    case ResultUnpublishable(detail)    => s"result unpublishable: $detail"
     case HeartbeatUnwritable(n, detail) =>
       s"heartbeat unwritable after $n consecutive failures: $detail"
 
@@ -219,7 +219,7 @@ object PilotLoop:
             PilotHeartbeat(config.pilot, at, next, currentState, currentClaim)
           )
           _ <- written match
-            case Right(()) => heartbeatWriteFailures.set(0)
+            case Right(())     => heartbeatWriteFailures.set(0)
             case Left(failure) =>
               val detail = SpoolEvidence.describeWrite(failure)
               heartbeatWriteFailures.getAndUpdate(_ + 1).flatMap { previous =>
@@ -531,7 +531,9 @@ object PilotLoop:
       }
 
   private object Station:
-    /** Consecutive heartbeat write failures before the pilot exits as [[PilotFatal.HeartbeatUnwritable]]. */
+    /** Consecutive heartbeat write failures before the pilot exits as
+      * [[PilotFatal.HeartbeatUnwritable]].
+      */
     val maxConsecutiveHeartbeatFailures: Int = 3
 
     def create(

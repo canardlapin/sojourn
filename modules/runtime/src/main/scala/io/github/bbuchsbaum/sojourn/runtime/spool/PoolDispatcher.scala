@@ -247,9 +247,8 @@ object PoolDispatcher:
                 .takeThrough(snapshot => !snapshot.isRevoked)
                 .map(_.lastTransition)
                 .unNone
-              (replay ++ live).filterWithPrevious((previous, next) =>
-                !(isGranted(previous) && isGranted(next))
-              )
+              (replay ++ live)
+                .filterWithPrevious((previous, next) => !(isGranted(previous) && isGranted(next)))
         }
 
     private def isGranted(event: LeaseEvent): Boolean = event match
@@ -302,7 +301,9 @@ object PoolDispatcher:
             .map(failure =>
               OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}")
             )
-            .map(bytes => PreparedInput.Carried(ByteVectors.toVector(bytes), AtomicFiles.digestOf(bytes)))
+            .map(bytes =>
+              PreparedInput.Carried(ByteVectors.toVector(bytes), AtomicFiles.digestOf(bytes))
+            )
         case TaskInput.Stored(ref) =>
           Right(PreparedInput.Referenced(ref.path, ref.digest))
 
@@ -318,7 +319,7 @@ object PoolDispatcher:
       // Mask only the registration boundary (closed check + insert + post-insert recheck).
       // Staging / spool publish is cancelable external work — LocalSite's shape.
       register(op, identity, proposed, key).flatMap {
-        case Left(rejection) => IO.pure(Left(rejection))
+        case Left(rejection)                  => IO.pure(Left(rejection))
         case Right(Registered.Existing(task)) =>
           IO.pure(Right(taskHandle[O](task)))
         case Right(Registered.Fresh(task, minted, submittedAt)) =>
@@ -388,7 +389,7 @@ object PoolDispatcher:
                             case None => (current.updated(key, candidate), Right(candidate))
                         }
                         outcome <- decision match
-                          case Left(rejection) => IO.pure(Left(rejection))
+                          case Left(rejection)                  => IO.pure(Left(rejection))
                           case Right(task) if task eq candidate =>
                             // Re-check closure AFTER the insertion: `closed` flips before the
                             // terminal sweep enumerates tasks, so an insert the sweep cannot see
@@ -1076,7 +1077,7 @@ object PoolDispatcher:
                           case None => previous.phase
                     val holderUnknown = holderTrack.exists(track =>
                       track.liveness match
-                        case PilotLiveness.Unobservable(_)                     => isStale(track, tick)
+                        case PilotLiveness.Unobservable(_) => isStale(track, tick)
                         case PilotLiveness.Running | PilotLiveness.Terminal(_) => false
                     )
                     val freshness =

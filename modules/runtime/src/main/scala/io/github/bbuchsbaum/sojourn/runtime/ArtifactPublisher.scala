@@ -22,9 +22,9 @@ import java.util.UUID
 
 /** Promotes operation output into a [[SiteStore]] and publishes only complete artifact sets.
   *
-  * State machine: [[PublisherState.Open]] → [[PublisherState.Sealed]] via CAS on [[finish]].
-  * Writes claim a token under Open; only the owning token may complete a slot; late writes after
-  * seal return [[ArtifactWriteFailure.PublisherClosed]]; repeated finish is idempotent.
+  * State machine: [[PublisherState.Open]] → [[PublisherState.Sealed]] via CAS on [[finish]]. Writes
+  * claim a token under Open; only the owning token may complete a slot; late writes after seal
+  * return [[ArtifactWriteFailure.PublisherClosed]]; repeated finish is idempotent.
   */
 final class ArtifactPublisher[F[_]: Async] private (
     store: SiteStore[F],
@@ -95,6 +95,7 @@ final class ArtifactPublisher[F[_]: Async] private (
             )
         }
     }
+
   /** Seal the attempt. Sole publication point; idempotent after the first seal. */
   def finish: F[Either[ArtifactPublicationFailure, ArtifactSet]] =
     state.modify {
@@ -162,7 +163,7 @@ final class ArtifactPublisher[F[_]: Async] private (
   ): F[Unit] =
     state.update {
       case sealedState: PublisherState.Sealed => sealedState
-      case PublisherState.Open(slots) =>
+      case PublisherState.Open(slots)         =>
         slots.get(path) match
           case Some(Slot.Writing(_, owned)) if owned == token =>
             PublisherState.Open(slots.updated(path, Slot.Published(token, ref)))
@@ -174,14 +175,16 @@ final class ArtifactPublisher[F[_]: Async] private (
       token: ClaimToken,
       failure: ArtifactWriteFailure
   ): F[Either[ArtifactWriteFailure, ArtifactReceipt]] =
-    state.update {
-      case sealedState: PublisherState.Sealed => sealedState
-      case PublisherState.Open(slots) =>
-        slots.get(path) match
-          case Some(Slot.Writing(_, owned)) if owned == token =>
-            PublisherState.Open(slots.updated(path, Slot.Failed(token, failure)))
-          case _ => PublisherState.Open(slots)
-    }.as(Left(failure))
+    state
+      .update {
+        case sealedState: PublisherState.Sealed => sealedState
+        case PublisherState.Open(slots)         =>
+          slots.get(path) match
+            case Some(Slot.Writing(_, owned)) if owned == token =>
+              PublisherState.Open(slots.updated(path, Slot.Failed(token, failure)))
+            case _ => PublisherState.Open(slots)
+      }
+      .as(Left(failure))
 
 object ArtifactPublisher:
   final case class ClaimToken(value: String) derives CanEqual

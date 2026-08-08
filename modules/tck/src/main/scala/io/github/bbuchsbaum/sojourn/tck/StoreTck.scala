@@ -164,7 +164,7 @@ abstract class StoreTck extends CatsEffectSuite:
     for
       put <- store.putStream(Stream.emits(payload).covary[IO], TckWire.stringInputSchema)
       ref <- put match
-        case Right(value) => IO.pure(value)
+        case Right(value)  => IO.pure(value)
         case Left(failure) => IO.raiseError(new RuntimeException(s"putStream failed: $failure"))
       corrupted <- siteFixture().corrupt(ref)
       _ <- IO(assume(corrupted, "backend store cannot be corrupted out-of-band"))

@@ -29,7 +29,8 @@ object Program:
     val catalog = OperationCatalog
       .fromContracts(contracts)
       .fold(
-        failure => throw new IllegalArgumentException(s"invalid program catalog: ${failure.reason}"),
+        failure =>
+          throw new IllegalArgumentException(s"invalid program catalog: ${failure.reason}"),
         identity
       )
     new Program(ordered, catalog, catalog.fingerprint)

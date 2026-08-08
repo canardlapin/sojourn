@@ -71,10 +71,10 @@ final class LocalSiteUnavailable(val failure: PreflightFailure)
   */
 final class LocalPoolUnavailable(detail: String) extends RuntimeException(detail)
 
-/** The scheduler-free [[PoolCapableSite]]: batch tasks execute on supervised fibers of this process,
-  * but through the same store-mediated result path as any remote backend — every success is a
-  * digest-verified [[RemoteRef]] in the site store, never an in-memory value. The pool runs real
-  * [[PilotLoop]]s over a real filesystem spool (real rename races), dispatched by the shared
+/** The scheduler-free [[PoolCapableSite]]: batch tasks execute on supervised fibers of this
+  * process, but through the same store-mediated result path as any remote backend — every success
+  * is a digest-verified [[RemoteRef]] in the site store, never an in-memory value. The pool runs
+  * real [[PilotLoop]]s over a real filesystem spool (real rename races), dispatched by the shared
   * [[PoolDispatcher]].
   *
   * IO-shaped by commitment, not accident: the pilot runtime is the same code that runs inside the
@@ -357,7 +357,9 @@ object LocalSite:
             .map(failure =>
               OperationRunFailure.InvalidInput(s"${failure.code}: ${failure.message}")
             )
-            .map(bytes => PreparedInput.Carried(ByteVectors.toVector(bytes), AtomicFiles.digestOf(bytes)))
+            .map(bytes =>
+              PreparedInput.Carried(ByteVectors.toVector(bytes), AtomicFiles.digestOf(bytes))
+            )
         case TaskInput.Stored(ref) =>
           Right(PreparedInput.Referenced(ref.path, ref.digest))
 
@@ -386,27 +388,29 @@ object LocalSite:
               closed.get.flatMap { isClosed =>
                 if isClosed then IO.pure(Left(SubmitRejection.Closed))
                 else
-                  tasks.modify { current =>
-                    current.get(key) match
-                      case Some(existing) if existing.fingerprint == proposed =>
-                        (current, Right(existing))
-                      case Some(existing) =>
-                        (
-                          current,
-                          Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed))
-                        )
-                      case None => (current.updated(key, candidate), Right(candidate))
-                  }.flatMap {
-                    case Left(rejection) => IO.pure(Left(rejection))
-                    case Right(task) if task eq candidate =>
-                      // Post-insert closed recheck (parity with pool): withdraw if release won.
-                      closed.get.flatMap {
-                        case true =>
-                          tasks.update(_ - key).as(Left(SubmitRejection.Closed))
-                        case false => IO.pure(Right(task))
-                      }
-                    case Right(task) => IO.pure(Right(task))
-                  }
+                  tasks
+                    .modify { current =>
+                      current.get(key) match
+                        case Some(existing) if existing.fingerprint == proposed =>
+                          (current, Right(existing))
+                        case Some(existing) =>
+                          (
+                            current,
+                            Left(SubmitRejection.Conflict(key, existing.fingerprint, proposed))
+                          )
+                        case None => (current.updated(key, candidate), Right(candidate))
+                    }
+                    .flatMap {
+                      case Left(rejection)                  => IO.pure(Left(rejection))
+                      case Right(task) if task eq candidate =>
+                        // Post-insert closed recheck (parity with pool): withdraw if release won.
+                        closed.get.flatMap {
+                          case true =>
+                            tasks.update(_ - key).as(Left(SubmitRejection.Closed))
+                          case false => IO.pure(Right(task))
+                        }
+                      case Right(task) => IO.pure(Right(task))
+                    }
               }
             }.flatMap {
               case Left(rejection) => IO.pure(Left(rejection))
@@ -593,7 +597,7 @@ object LocalSite:
       */
     private def storeFailureCodes(failure: StoreFailure): Vector[String] =
       failure match
-        case StoreFailure.NotFound(path) => Vector("not-found", path.value)
+        case StoreFailure.NotFound(path)                  => Vector("not-found", path.value)
         case StoreFailure.ForeignSite(expected, observed) =>
           Vector("foreign-site", expected.value, observed.value)
         case StoreFailure.SchemaMismatch(expected, observed) =>

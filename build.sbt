@@ -12,6 +12,10 @@ ThisBuild / tlJdkRelease := Some(17)
 ThisBuild / githubWorkflowJavaVersions := Seq(JavaSpec.temurin("17"), JavaSpec.temurin("21"))
 ThisBuild / tlCiScalafmtCheck := true
 ThisBuild / tlCiHeaderCheck := false
+// Dependency submission needs contents:write on GITHUB_TOKEN; this repo's
+// Actions token cannot call the Dependency Submission API (403). Keep CI
+// green without requiring an admin change to workflow permissions.
+ThisBuild / tlCiDependencyGraphJob := false
 ThisBuild / githubWorkflowBuild += WorkflowStep.Sbt(
   List("checkModuleBoundaries"),
   name = Some("Check module boundaries")

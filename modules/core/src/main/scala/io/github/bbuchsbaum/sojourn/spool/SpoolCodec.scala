@@ -132,9 +132,9 @@ object SpoolCodec:
       _ <- Either.cond(sequence >= 0L, (), Malformed("field 'sequence' must not be negative"))
       state <- stringField(obj, "state").flatMap(pilotStateFrom)
       claimed <- obj("claimed") match
-        case None                   => Right(None)
+        case None                        => Right(None)
         case Some(value) if value.isNull => Right(None)
-        case Some(value)            =>
+        case Some(value)                 =>
           for
             claimObj <- value.asObject.toRight(Malformed("field 'claimed' must be an object"))
             key <- identifier(claimObj, "key", SubmissionKey.from)

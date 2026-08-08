@@ -67,6 +67,7 @@ enum SpoolIntegrityFailure derives CanEqual:
         s"(key '${bodyKey.value}', e${bodyEpoch.value})"
     case PilotIdentityMismatch(path, expected, observed) =>
       s"pilot identity mismatch at $path: filename '${expected.value}' vs body '${observed.value}'"
+
 /** How a result publication concluded: [[AlreadyPublished]] is typed and non-fatal — the published
   * result stands (invariant I2 admits exactly one result file per (key, epoch)).
   */
@@ -187,7 +188,10 @@ final class SpoolFiles[F[_]: Sync](
       case Right(target) =>
         Sync[F].blocking(
           AtomicFiles
-            .publishOnceBlocking(target, ByteVectors.of(SpoolCodec.encodeRegistration(registration)))
+            .publishOnceBlocking(
+              target,
+              ByteVectors.of(SpoolCodec.encodeRegistration(registration))
+            )
             .map(_ => ())
         )
 
@@ -254,7 +258,10 @@ final class SpoolFiles[F[_]: Sync](
         Sync[F].blocking {
           try
             val _ = JFiles.createDirectories(paths.pending)
-            AtomicFiles.writeNewBlocking(target, ByteVectors.of(SpoolCodec.encodeInvocation(invocation))) match
+            AtomicFiles.writeNewBlocking(
+              target,
+              ByteVectors.of(SpoolCodec.encodeInvocation(invocation))
+            ) match
               case Right(())                                      => Right(())
               case Left(AtomicFiles.WriteFailure.TargetExists(_)) => Right(())
               case Left(other)                                    => Left(other)
@@ -375,7 +382,10 @@ final class SpoolFiles[F[_]: Sync](
     */
   def writeDrain(drain: SpoolDrain): F[Either[AtomicFiles.WriteFailure, Unit]] =
     Sync[F].blocking {
-      AtomicFiles.writeNewBlocking(paths.drainMarker, ByteVectors.of(SpoolCodec.encodeDrain(drain))) match
+      AtomicFiles.writeNewBlocking(
+        paths.drainMarker,
+        ByteVectors.of(SpoolCodec.encodeDrain(drain))
+      ) match
         case Right(())                                      => Right(())
         case Left(AtomicFiles.WriteFailure.TargetExists(_)) => Right(())
         case Left(other)                                    => Left(other)

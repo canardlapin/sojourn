@@ -236,7 +236,6 @@ object SiteOperation:
   ): Either[ValidationFailure, SiteOperation[I, O]] =
     fromDescriptor(descriptor, input, result, ReexecutionPolicy.fromRetrySafety(retrySafety))
 
-
 /** The set of operations a site can execute — the registry handshake made data.
   *
   * Entries are full [[OperationContract]] values (schemas, artifacts, re-execution). Construction
@@ -329,7 +328,8 @@ final case class PoolSpec private (
       worker: WorkerProfile,
       lease: LeaseRequest = LeaseRequest.BackendDefault,
       grantPolicy: GrantPolicy = GrantPolicy(
-        scala.concurrent.duration.FiniteDuration(readyTimeout.value, java.util.concurrent.TimeUnit.MILLISECONDS)
+        scala.concurrent.duration
+          .FiniteDuration(readyTimeout.value, java.util.concurrent.TimeUnit.MILLISECONDS)
       ),
       degradationPolicy: DegradationPolicy = DegradationPolicy.RemainLive
   ): PoolRequest =

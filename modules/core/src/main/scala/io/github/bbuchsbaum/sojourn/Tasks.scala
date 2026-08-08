@@ -40,9 +40,9 @@ object TaskPhase:
 
   /** Coarse Admitted / Active / Terminal projection. */
   def lifecycle(phase: TaskPhase): TaskLifecycle = phase match
-    case Queued                 => TaskLifecycle.Admitted
-    case Dispatched | Running   => TaskLifecycle.Active
-    case Settled                => TaskLifecycle.Terminal
+    case Queued               => TaskLifecycle.Admitted
+    case Dispatched | Running => TaskLifecycle.Active
+    case Settled              => TaskLifecycle.Terminal
 
 /** Monotone coarse lifecycle (plan 3.8). [[TaskPhase]] remains the detailed observation surface. */
 enum TaskLifecycle derives CanEqual:
