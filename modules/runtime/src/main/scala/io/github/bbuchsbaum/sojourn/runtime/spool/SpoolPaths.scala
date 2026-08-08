@@ -332,8 +332,6 @@ final class SpoolFiles[F[_]: Sync](
               case Left(AtomicFiles.WriteFailure.TargetExists(_)) =>
                 Right(ResultPublication.AlreadyPublished)
               case Left(other) => Left(other)
-              case Left(other) => Left(other)
-              case Left(other) => Left(other)
           }
 
   /** Targeted result check for (`keyToken`, `epoch`): absence is `None` (the ordinary state while
@@ -378,11 +376,9 @@ final class SpoolFiles[F[_]: Sync](
   def writeDrain(drain: SpoolDrain): F[Either[AtomicFiles.WriteFailure, Unit]] =
     Sync[F].blocking {
       AtomicFiles.writeNewBlocking(paths.drainMarker, ByteVectors.of(SpoolCodec.encodeDrain(drain))) match
-        case Right(())                                                   => Right(())
-        case Left(AtomicFiles.WriteFailure.TargetExists(_))              => Right(())
-        case Left(other) => Left(other)
-        case Left(other) => Left(other)
-        case Left(other) => Left(other)
+        case Right(())                                      => Right(())
+        case Left(AtomicFiles.WriteFailure.TargetExists(_)) => Right(())
+        case Left(other)                                    => Left(other)
     }
 
   /** Whether the drain marker exists. An unreadable spool must never silently read as "not

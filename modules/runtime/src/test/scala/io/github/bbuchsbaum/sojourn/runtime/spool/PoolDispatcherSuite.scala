@@ -697,8 +697,10 @@ class PoolDispatcherSuite extends CatsEffectSuite:
     environment(staticObserver(_ => PilotLiveness.Running)).use { env =>
       def grantedCount(events: Vector[LeaseEvent]): Int =
         events.count {
-          case LeaseEvent.Granted(_)                                                   => true
-          case LeaseEvent.Degraded(_, _) | LeaseEvent.Renewing | LeaseEvent.Revoked(_) => false
+          case LeaseEvent.Granted(_) => true
+          case LeaseEvent.Degraded(_, _) | LeaseEvent.Renewing | LeaseEvent.Revoked(_) |
+              LeaseEvent.BelowFloor(_, _) | LeaseEvent.Recovered(_) =>
+            false
         }
       for
         eventsRef <- Ref.of[IO, Vector[LeaseEvent]](Vector.empty)

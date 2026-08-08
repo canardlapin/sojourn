@@ -1,7 +1,8 @@
-# Optional sibling integration — not the default CI path.
+# Optional sibling integration against an unreleased slurm4s SHA.
 #
-# Default CI resolves published remote-exec-kernel / slurm4s-* coordinates.
-# Use this workflow when validating Sojourn against an unreleased slurm4s SHA.
+# Default CI (ci.yml) now publishLocals the same pin before `sbt +update` until
+# remote-exec-kernel / slurm4s-* 0.1.0 reach Maven Central (M0). Keep this
+# workflow for SHA bumps and as a focused integration lane.
 
 name: Sibling slurm4s integration
 
@@ -11,7 +12,9 @@ on:
     paths:
       - 'slurm4s.sha'
       - 'project/Dependencies.scala'
+      - 'build.sbt'
       - '.github/workflows/sibling-slurm4s.yml'
+      - '.github/workflows/ci.yml'
 
 jobs:
   sibling:

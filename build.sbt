@@ -16,17 +16,65 @@ ThisBuild / githubWorkflowBuild += WorkflowStep.Sbt(
   List("checkModuleBoundaries"),
   name = Some("Check module boundaries")
 )
+// Only options not already provided by sbt-typelevel. Duplicating -Wunused:* /
+// -Wvalue-discard makes the compiler emit "set redundantly" warnings that fail CI
+// under -Werror (GITHUB_ACTIONS).
 ThisBuild / scalacOptions ++= Seq(
   "-Xmax-inlines:64",
   "-language:strictEquality",
-  "-Wunused:imports",
-  "-Wunused:locals",
-  "-Wunused:privates",
-  "-Wvalue-discard",
   "-Wnonunit-statement"
 )
 ThisBuild / Test / fork := true
 ThisBuild / dependencyOverrides += Libraries.munit
+
+// remote-exec-kernel / slurm4s-* 0.1.0 are not on Maven Central yet (M0). Until they
+// are, every generated job that runs `sbt +update` must publishLocal the pinned SHA
+// first — same contract as .github/workflows/sibling-slurm4s.yml.
+ThisBuild / githubWorkflowJobSetup ~= { steps =>
+  val checkoutSlurm4s = WorkflowStep.Use(
+    UseRef.Public("actions", "checkout", "v6"),
+    name = Some("Checkout pinned slurm4s"),
+    params = Map(
+      "repository" -> "canardlapin/slurm4s",
+      "path" -> "slurm4s-src"
+    )
+  )
+  val pinSlurm4s = WorkflowStep.Run(
+    List(
+      "pin=\"$(cat slurm4s.sha)\"",
+      "git -C slurm4s-src fetch --depth 1 origin \"$pin\"",
+      "git -C slurm4s-src checkout \"$pin\""
+    ),
+    name = Some("Pin slurm4s SHA")
+  )
+  def publishPinned(cond: Option[String]): WorkflowStep =
+    WorkflowStep.Run(
+      List(
+        "sbt -batch " +
+          "'set ThisBuild/version := \"0.1.0\"' " +
+          "'set ThisBuild/isSnapshot := false' " +
+          "'++ 3.7.4' " +
+          "publishLocal"
+      ),
+      name = Some("Publish pinned slurm4s 0.1.0 locally"),
+      cond = cond,
+      workingDirectory = Some("slurm4s-src")
+    )
+
+  // After sojourn checkout: fetch the pin. Before each matrix `+update` (and always for
+  // that java, even on cache hit): publishLocal. ivy2/local is not part of the sbt cache,
+  // so a cache-hit skip of update still needs a fresh publishLocal before test.
+  steps.headOption.toList ++
+    List(checkoutSlurm4s, pinSlurm4s) ++
+    steps.drop(1).flatMap {
+      case step: WorkflowStep.Sbt if step.commands == List("+update") =>
+        val javaCond = step.cond.map { cond =>
+          cond.split("&&", 2).headOption.map(_.trim).filter(_.nonEmpty).getOrElse(cond)
+        }
+        List(publishPinned(javaCond), step)
+      case step => List(step)
+    }
+}
 
 /** Fail if scheduler artifacts leak into modules that must stay provider-neutral. */
 lazy val checkModuleBoundaries = taskKey[Unit](
